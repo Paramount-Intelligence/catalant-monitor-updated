@@ -4,7 +4,7 @@
 .env.local
 .env.*.local
 
-# Session files (cookies only - catalant_projects.db is tracked)
+# Session files (cookies only)
 catalant_cookies.json
 
 # Python
@@ -51,3 +51,21 @@ Thumbs.db
 
 # Test files (keep original)
 script_test.py
+*.backup.py
+script_clean.backup.py
+
+# Local evidence / debug dumps
+catalant-evidence/
+*_inspect_*.png
+*_inspect_*.json
+
+# Supabase CLI local artifacts
+supabase/.temp/
+supabase/.branches/
+
+node_modules/
+package-lock.json
+
+# Local tooling downloads
+.tools/
+

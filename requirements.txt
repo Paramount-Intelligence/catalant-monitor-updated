@@ -1,17 +1,4 @@
-# Selenium for web automation
-selenium>=4.15.0
-
-# Automatic chromedriver management (handles version mismatches in containers)
-webdriver-manager>=4.0.0
-
-# Environment variable management
-python-dotenv>=1.0.0
-
-# MongoDB driver (Atlas cloud DB)
-pymongo>=4.0.0
-dnspython>=2.0.0
-
-# Note: You also need ChromeDriver installed and in your PATH
-# Download from: https://chromedriver.chromium.org/
-# Or install via: pip install webdriver-manager
-# Then the script can auto-download the driver
+selenium==4.46.0
+webdriver-manager==4.1.2
+python-dotenv==1.2.2
+supabase==2.31.0

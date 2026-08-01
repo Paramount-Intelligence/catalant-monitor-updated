@@ -11,12 +11,12 @@ import traceback
 import hashlib
 import tempfile
 import mimetypes
+import argparse
 from email.message import EmailMessage
 
 # Ensure UTF-8 output on all platforms (fixes Windows emoji crash)
 if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8')
-from pymongo import MongoClient, UpdateOne
 from datetime import datetime, timezone, timedelta
 
 PKT = timezone(timedelta(hours=5))  # Pakistan Standard Time (UTC+5)
@@ -32,10 +32,13 @@ from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.chrome.options import Options
 from dotenv import load_dotenv
 
+import database as db
+import extraction
+
 # Load environment variables
 load_dotenv()
 
-TEST_ERROR_EMAIL_MODE = "--test-error-email" in sys.argv
+PLATFORM = db.PLATFORM_CATALANT
 
 # ============================
 # CONFIGURATION
@@ -73,9 +76,13 @@ class Config:
     CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", 60))
     MAX_AGE_MINUTES = int(os.getenv("MAX_AGE_MINUTES", 60))
     REPOST_MIN_DAYS = int(os.getenv("REPOST_MIN_DAYS", "3"))
+    EMAIL_MAX_RETRIES = int(os.getenv("EMAIL_MAX_RETRIES", "5"))
+    EMAIL_RETRY_BASE_MINUTES = int(os.getenv("EMAIL_RETRY_BASE_MINUTES", "15"))
+    DETAIL_FETCH_DELAY_SECONDS = float(os.getenv("DETAIL_FETCH_DELAY_SECONDS", "2"))
+    DETAIL_MAX_ATTEMPTS = int(os.getenv("DETAIL_MAX_ATTEMPTS", "2"))
     HEADLESS = os.getenv("HEADLESS", "False").lower() == "true"
     COOKIES_FILE = os.getenv("COOKIES_FILE", "catalant_cookies.json")
-    MONGO_URI    = os.getenv("MONGO_URI", "mongodb://localhost:27017/")
+    SUPABASE_URL = os.getenv("SUPABASE_URL", "")
     EVIDENCE_DIR = _resolve_evidence_dir()
     EVIDENCE_RETENTION_HOURS = int(os.getenv("EVIDENCE_RETENTION_HOURS", "24"))
 
@@ -99,22 +106,38 @@ _BLOCKED_ATTACHMENT_NAMES = {
 # OPERATIONAL ERROR ALERTS
 # ============================
 def redact_sensitive_text(value):
-    """Redact credentials, tokens, cookies, and Mongo URI userinfo from text."""
+    """Redact credentials, tokens, cookies, and database secrets from text."""
     if value is None:
         return ""
     out = str(value)
     for secret in (
         Config.CATALANT_PASSWORD,
         Config.SENDER_PASSWORD,
+        os.getenv("SUPABASE_SECRET_KEY"),
+        os.getenv("SUPABASE_SERVICE_ROLE_KEY"),
+        os.getenv("SUPABASE_ACCESS_TOKEN"),
+        os.getenv("SUPABASE_DB_PASSWORD"),
+        os.getenv("SUPABASE_DB_URL"),
+        os.getenv("MONGO_URI"),
     ):
         if secret:
             out = out.replace(secret, "[REDACTED_PASSWORD]")
-    # MongoDB credentials in URI
     out = re.sub(
         r"(mongodb(?:\+srv)?://)([^:@/\s]+):([^@/\s]+)@",
         r"\1[REDACTED_USER]:[REDACTED_PASSWORD]@",
         out,
         flags=re.IGNORECASE,
+    )
+    out = re.sub(
+        r"(postgresql(?:\+?\w*)?://)([^:@/\s]+):([^@/\s]+)@",
+        r"\1[REDACTED_USER]:[REDACTED_PASSWORD]@",
+        out,
+        flags=re.IGNORECASE,
+    )
+    out = re.sub(
+        r"(?i)(sb_secret_|sb_publishable_)[A-Za-z0-9._\-]+",
+        "[REDACTED_KEY]",
+        out,
     )
     out = re.sub(r"(?i)bearer\s+[A-Za-z0-9\-._~+/]+=*", "Bearer [REDACTED_TOKEN]", out)
     out = re.sub(
@@ -128,7 +151,7 @@ def redact_sensitive_text(value):
         out,
     )
     out = re.sub(
-        r"(?i)(password|passwd|pwd|token|access_token|refresh_token)\s*[=:]\s*[^\s&]+",
+        r"(?i)(password|passwd|pwd|token|access_token|refresh_token|secret[_-]?key)\s*[=:]\s*[^\s&]+",
         r"\1=[REDACTED]",
         out,
     )
@@ -500,7 +523,8 @@ def print_startup_banner():
     print("Catalant Project Monitor")
     print(f"Account: {Config.CATALANT_EMAIL or '(not set)'}")
     print(f"Interval: {Config.CHECK_INTERVAL}s")
-    print(f"Repost alert gap: > {Config.REPOST_MIN_DAYS} days")
+    print(f"Repeat occurrence gap: > {Config.REPOST_MIN_DAYS} days (scraped_at)")
+    print(f"Supabase URL set: {bool((Config.SUPABASE_URL or '').strip())}")
     print(f"Project recipients: {', '.join(Config.RECIPIENT_EMAILS) if Config.RECIPIENT_EMAILS else '(none)'}")
     if Config.ERROR_RECIPIENTS:
         print(f"Error recipients: {', '.join(Config.ERROR_RECIPIENTS)}")
@@ -517,7 +541,7 @@ def print_startup_banner():
 
 
 def run_test_error_email():
-    """Force-send a test operational alert; skip Selenium/Mongo."""
+    """Force-send a test operational alert; skip Selenium/Supabase."""
     print_startup_banner()
     ok, missing = validate_error_email_configuration()
     if not ok:
@@ -604,36 +628,27 @@ def classify_login_failure(driver, exc=None):
 # ============================
 # SESSION MANAGEMENT
 # ============================
-_mongo_client = None
-
-def _get_session_collection():
-    """MongoDB collection for storing Catalant session cookies."""
-    global _mongo_client
-    if _mongo_client is None:
-        _mongo_client = MongoClient(Config.MONGO_URI)
-    return _mongo_client["office_monitor"]["sessions"]
-
 def save_cookies(driver):
-    """Save session cookies to MongoDB AND local file as fallback."""
+    """Save session cookies to Supabase AND local file as fallback."""
     cookies = driver.get_cookies()
     cookie_count = len(cookies) if cookies is not None else 0
-    # MongoDB (primary)
     try:
-        _get_session_collection().update_one(
-            {"_id": "catalant_cookies"},
-            {"$set": {"cookies": cookies, "saved_at": datetime.now(timezone.utc)}},
-            upsert=True
-        )
+        db.save_scraper_session(PLATFORM, cookies or [])
+        print(f"  Saved {cookie_count} cookie(s) to Supabase scraper_sessions")
     except Exception as e:
-        print(f"  ⚠️ Could not save cookies to MongoDB: {redact_sensitive_text(e)}")
+        print(f"  ⚠️ Could not save cookies to Supabase: {redact_sensitive_text(e)}")
         send_error_notification(
-            "COOKIE_SAVE:MONGODB",
+            "COOKIE_SAVE:SUPABASE",
             e,
-            details=f"cookie_count={cookie_count}\nsource=mongodb",
+            details=f"cookie_count={cookie_count}\nsource=supabase table=scraper_sessions",
             traceback_text=traceback.format_exc(),
-            diagnostics={**_safe_driver_info(driver), "operation": "cookie_save_mongo", "record_count": cookie_count},
+            diagnostics={
+                **_safe_driver_info(driver),
+                "operation": "cookie_save_supabase",
+                "record_count": cookie_count,
+                "platform": PLATFORM,
+            },
         )
-    # Local file fallback
     try:
         with open(Config.COOKIES_FILE, 'w') as f:
             json.dump(cookies, f)
@@ -649,26 +664,41 @@ def save_cookies(driver):
     return True
 
 def load_cookies(driver):
-    """Load cookies from MongoDB first, fall back to local file."""
+    """Load cookies from Supabase first, fall back to local file."""
     cookies = None
     source = None
-    # Try MongoDB first
     try:
-        doc = _get_session_collection().find_one({"_id": "catalant_cookies"})
-        if doc and doc.get("cookies"):
-            cookies = doc["cookies"]
-            source = "mongodb"
-            print("  Loaded cookies from MongoDB")
+        session = db.load_scraper_session(PLATFORM)
+        if session:
+            session_data = session.get("session_data") or {}
+            if isinstance(session_data, str):
+                try:
+                    session_data = json.loads(session_data)
+                except Exception:
+                    session_data = {}
+            loaded = session_data.get("cookies") if isinstance(session_data, dict) else None
+            if loaded:
+                cookies = loaded
+                source = "supabase"
+                print("  Loaded cookies from Supabase")
     except Exception as e:
-        print(f"  ⚠️ Could not load cookies from MongoDB: {redact_sensitive_text(e)}")
-        send_error_notification(
-            "COOKIE_LOAD:MONGODB",
-            e,
-            details="source=mongodb",
-            traceback_text=traceback.format_exc(),
-            diagnostics={**_safe_driver_info(driver), "operation": "cookie_load_mongo"},
-        )
-    # Fall back to local file
+        err_text = redact_sensitive_text(e)
+        print(f"  ⚠️ Could not load cookies from Supabase: {err_text}")
+        # Missing schema is a setup issue — fall back to local cookies without alert spam.
+        if not db.is_missing_schema_error(e):
+            send_error_notification(
+                "COOKIE_LOAD:SUPABASE",
+                e,
+                details="source=supabase table=scraper_sessions",
+                traceback_text=traceback.format_exc(),
+                diagnostics={
+                    **_safe_driver_info(driver),
+                    "operation": "cookie_load_supabase",
+                    "platform": PLATFORM,
+                },
+            )
+        else:
+            print("  ℹ️ Supabase schema not applied yet; using local cookie fallback")
     if not cookies:
         if not os.path.exists(Config.COOKIES_FILE):
             return False
@@ -802,202 +832,329 @@ def perform_login(driver):
 # PROJECT EXTRACTION
 # ============================
 def _first_platform_category(cat_text):
-    """Take the top-level category from a path like 'A > B > C' or 'A | B'."""
-    if not cat_text:
-        return ""
-    parts = re.split(r"\s*[>|›»→]\s*", cat_text.strip())
-    return parts[0].strip() if parts and parts[0].strip() else ""
+    path = extraction.category_path_from_text(cat_text)
+    return path[0] if path else ""
 
 
 def _extract_platform_category_from_text(text):
-    """Pull top-level category from breadcrumb text (A > B > C)."""
-    if not text:
-        return ""
-    text = (
-        text.replace("\u00a0", " ")
-        .replace("&gt;", ">")
-        .replace("&amp;", "&")
-        .strip()
+    cat, _path, _raw, rejected = extraction.normalize_category_candidate(
+        text, allow_single=True
     )
-    # Normalize uncommon separators to >
-    text = re.sub(r"\s*[›»→]\s*", " > ", text)
-    if ">" in text or "|" in text:
-        return _first_platform_category(text)
-    # Single-segment category from a dedicated element (no separator)
-    if 3 <= len(text) <= 80 and "\n" not in text and ":" not in text:
-        # Avoid grabbing random UI labels
-        lowered = text.lower()
-        noise = ("posted", "login", "search", "budget", "location", "timeline", "start date")
-        if not any(n in lowered for n in noise):
-            return text.strip()
-    return ""
+    if rejected or not cat:
+        return ""
+    return cat
 
 
-def _extract_platform_category(driver, body_text=""):
-    """Best-effort platform category from detail/card DOM or body text."""
-    # 1) Known Catalant category CSS hooks
-    for sel in (
-        ".text-gray.text-size-14.line-height-170",
-        "[class*='line-height-170']",
-        ".need-card-inline-pools .small.text-muted",
-        ".need-card-inline-pools .text-muted",
-        "[class*='need-card'] [class*='pool']",
-    ):
-        try:
-            for el in driver.find_elements(By.CSS_SELECTOR, sel):
-                raw = (el.text or "").strip()
-                cat = _extract_platform_category_from_text(raw)
-                if not cat:
-                    continue
-                if ">" in raw or "|" in raw or "›" in raw or "»" in raw:
-                    return cat
-                # Accept single-segment only from the primary category class
-                if "line-height-170" in sel:
-                    return cat
-        except Exception:
-            pass
-
-    # 2) XPath: any visible node whose text contains a breadcrumb separator
+def extract_platform_category(root, body_text=""):
+    """
+    Priority:
+      1. Verified structured labeled field
+      2. Verified dedicated category selector
+      3. Verified category breadcrumb
+      4. Verified embedded structured page data
+      5. Bounded label-specific text fallback
+      6. Empty + MISSING
+    Never invents Unclassified.
+    """
+    # 1) Structured labeled field
     try:
-        for el in driver.find_elements(
+        for el in root.find_elements(
             By.XPATH,
-            "//*[contains(normalize-space(.),'>') or contains(.,'›') or contains(.,'|')]"
+            ".//*[contains(translate(normalize-space(.),"
+            "'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'category:') "
+            "or contains(translate(normalize-space(.),"
+            "'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'practice area:') "
+            "or contains(translate(normalize-space(.),"
+            "'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'functional area:')]",
         ):
             raw = (el.text or "").strip()
-            if not raw or len(raw) > 200:
+            if not raw or len(raw) > 180:
                 continue
-            # Prefer short breadcrumb lines, not huge page chunks
-            if raw.count("\n") > 2:
+            m = re.search(
+                r"(?:Category|Practice Area|Functional Area)\s*:\s*(.+)$",
+                raw,
+                re.IGNORECASE | re.DOTALL,
+            )
+            if not m:
                 continue
-            cat = _extract_platform_category_from_text(raw)
-            if cat and (">" in raw or "|" in raw or "›" in raw):
-                return cat
+            cat, path, cleaned, rejected = extraction.normalize_category_candidate(
+                m.group(1), allow_single=True
+            )
+            if rejected == "invalid_placeholder":
+                return extraction.category_result(
+                    None, path, cleaned, "structured_label", None, "REJECTED_INVALID_CANDIDATE"
+                )
+            if cat:
+                return extraction.category_result(
+                    cat, path, cleaned, "structured_label", "HIGH", "FOUND_STRUCTURED"
+                )
     except Exception:
         pass
 
-    # 3) Body-text fallback: first breadcrumb-looking line
-    if body_text:
-        for m in re.finditer(
-            r"(?m)^([^\n:]{3,80}?)\s*[>|›»]\s*[^\n]{2,120}$",
-            body_text,
+    dedicated_selectors = (
+        ".need-card-inline-pools .small.text-muted",
+        ".need-card-inline-pools .text-muted",
+        "[class*='need-card'] [class*='pool']",
+        "[class*='category']",
+        "[class*='breadcrumb']",
+    )
+    for sel in dedicated_selectors:
+        try:
+            for el in root.find_elements(By.CSS_SELECTOR, sel):
+                raw = (el.text or "").strip()
+                if not raw:
+                    continue
+                allow_single = "pool" in sel.lower() or "categor" in sel.lower()
+                cat, path, cleaned, rejected = extraction.normalize_category_candidate(
+                    raw, allow_single=allow_single
+                )
+                if rejected == "invalid_placeholder":
+                    return extraction.category_result(
+                        None, path, cleaned, f"selector:{sel}", None, "REJECTED_INVALID_CANDIDATE"
+                    )
+                if cat and (len(path) > 1 or allow_single):
+                    return extraction.category_result(
+                        cat, path, cleaned, f"selector:{sel}", "HIGH", "FOUND_DEDICATED_SELECTOR"
+                    )
+        except Exception:
+            pass
+
+    for sel in (
+        ".text-gray.text-size-14.line-height-170",
+        "[class*='line-height-170']",
+    ):
+        try:
+            for el in root.find_elements(By.CSS_SELECTOR, sel):
+                raw = (el.text or "").strip()
+                if not raw:
+                    continue
+                cat, path, cleaned, rejected = extraction.normalize_category_candidate(
+                    raw, allow_single=False
+                )
+                if rejected == "invalid_placeholder":
+                    return extraction.category_result(
+                        None, path, cleaned, f"breadcrumb:{sel}", None, "REJECTED_INVALID_CANDIDATE"
+                    )
+                if cat and len(path) >= 2:
+                    return extraction.category_result(
+                        cat, path, cleaned, f"breadcrumb:{sel}", "HIGH", "FOUND_BREADCRUMB"
+                    )
+        except Exception:
+            pass
+
+    try:
+        for el in root.find_elements(
+            By.XPATH,
+            ".//*[contains(@class,'breadcrumb') or contains(@class,'pool')]",
         ):
-            cat = _extract_platform_category_from_text(m.group(0))
-            if cat:
-                return cat
-    return ""
+            raw = (el.text or "").strip()
+            if not raw or len(raw) > 160 or raw.count("\n") > 2:
+                continue
+            cat, path, cleaned, rejected = extraction.normalize_category_candidate(
+                raw, allow_single=False
+            )
+            if rejected == "invalid_placeholder":
+                return extraction.category_result(
+                    None, path, cleaned, "breadcrumb_node", None, "REJECTED_INVALID_CANDIDATE"
+                )
+            if cat and len(path) >= 2:
+                return extraction.category_result(
+                    cat, path, cleaned, "breadcrumb_node", "MEDIUM", "FOUND_BREADCRUMB"
+                )
+    except Exception:
+        pass
+
+    try:
+        scripts = root.find_elements(By.CSS_SELECTOR, "script[type='application/ld+json'], script")
+        for script in scripts[:30]:
+            content = script.get_attribute("innerHTML") or script.get_attribute("textContent") or ""
+            result = extraction.extract_category_from_embedded_json(content)
+            if result.get("platform_category_extraction_status") not in (None, "MISSING"):
+                if result.get("platform_category") or result.get(
+                    "platform_category_extraction_status"
+                ) == "REJECTED_INVALID_CANDIDATE":
+                    return result
+    except Exception:
+        pass
+
+    text_result = extraction.extract_category_from_body_text(body_text or "")
+    if text_result.get("platform_category") or text_result.get(
+        "platform_category_extraction_status"
+    ) == "REJECTED_INVALID_CANDIDATE":
+        return text_result
+    return extraction.category_result(None, [], None, None, None, "MISSING")
+
+
+def _extract_platform_category(driver, body_text=""):
+    result = extract_platform_category(driver, body_text=body_text)
+    return result.get("platform_category") or ""
 
 
 def extract_project_data(card):
     """Extract data from a project card - returns None if invalid"""
     try:
-        # Required: Title
         title_elem = card.find_element(By.CSS_SELECTOR, ".need-card-inline-name .line-clamp-2")
         title = title_elem.text.strip()
         if not title:
             return None
-        
-        # Required: Project ID
+
         try:
             like_button = card.find_element(By.CSS_SELECTOR, "[data-ajax-post*='need/']")
             match = re.search(r'/need/([^/]+)/', like_button.get_attribute("data-ajax-post"))
             if not match:
                 return None
             project_id = match.group(1)
-        except:
+        except Exception:
             return None
-        
-        # Optional: Platform Category (first segment of category path)
-        platform_category = ""
+
+        category_info = extraction.category_result(None, [], None, None, None, "MISSING")
         try:
-            platform_category = _extract_platform_category(card)
+            category_info = extract_platform_category(card)
         except Exception:
             pass
-        
+
         description = ""
         try:
-            description = card.find_element(By.CSS_SELECTOR, ".need-card-inline-details .line-clamp-2").text.strip()
-        except:
+            description = card.find_element(
+                By.CSS_SELECTOR, ".need-card-inline-details .line-clamp-2"
+            ).text.strip()
+        except Exception:
             pass
-        
+        # Reject noise short descriptions
+        if description and (
+            description.lower() == title.lower()
+            or description == (category_info.get("platform_category") or "")
+            or description.lower().startswith("posted")
+            or "$" in description and len(description) > 60
+        ):
+            description = ""
+
         location = ""
         try:
-            loc_text = card.find_element(By.CSS_SELECTOR, ".text-gray-25.font-weight-semibold").text.strip()
+            loc_text = card.find_element(
+                By.CSS_SELECTOR, ".text-gray-25.font-weight-semibold"
+            ).text.strip()
             location = loc_text if loc_text else ""
-        except:
+        except Exception:
             pass
 
         time_posted = "Unknown"
         try:
-            time_elems = card.find_elements(By.XPATH, ".//div[contains(@class, 'small') and contains(@class, 'text-gray-20') and contains(@class, 'mt-1')]//span[contains(text(), 'Posted')]")
+            time_elems = card.find_elements(
+                By.XPATH,
+                ".//div[contains(@class, 'small') and contains(@class, 'text-gray-20') "
+                "and contains(@class, 'mt-1')]//span[contains(text(), 'Posted')]",
+            )
             if time_elems:
                 time_posted = time_elems[0].text.replace("Posted", "").replace("ago", "").strip()
-        except:
+        except Exception:
             pass
 
-        # Optional: Budget
         budget = ""
         try:
             budget = card.find_element(By.CSS_SELECTOR, ".need-card-inline-budget").text.strip()
-        except:
+        except Exception:
             pass
+        # Do NOT scan arbitrary $ text — that falsely captured titles containing ($110/hr)
+        budget_fields = {}
+        if budget:
+            ok, reason = extraction.validate_budget_candidate(budget, {"title": title})
+            if ok:
+                budget_fields = extraction.parse_budget(budget)
+                budget_fields["budget_source"] = "card_dedicated_selector"
+                budget_fields["budget_confidence"] = "HIGH"
+            else:
+                budget = ""
+                budget_fields = {"extraction_warnings": [f"BUDGET_CANDIDATE_REJECTED_{reason.upper()}"]}
         if not budget:
-            try:
-                for el in card.find_elements(By.XPATH, ".//*[contains(text(),'$')]"):
-                    t = el.text.strip()
-                    if '$' in t and len(t) < 60:
-                        budget = t
-                        break
-            except:
-                pass
+            fallback = extraction.extract_title_rate_fallback(title)
+            if fallback.get("budget_text"):
+                budget_fields = fallback
+                budget = fallback["budget_text"]
 
-        # Optional: Duration / Project Length
         duration = ""
         try:
             duration = card.find_element(By.CSS_SELECTOR, ".need-card-inline-duration").text.strip()
-        except:
+        except Exception:
             pass
-        if not duration:
-            try:
-                for el in card.find_elements(By.XPATH, ".//span[contains(@class,'text-gray') or contains(@class,'small')]"):
-                    t = el.text.strip()
-                    if any(w in t.lower() for w in ("week", "month", "day")) and 2 < len(t) < 40:
-                        duration = t
-                        break
-            except:
-                pass
 
         status = "Posted"
         try:
             card.find_element(By.CSS_SELECTOR, ".badge-success")
             status = "New Project"
-        except:
+        except Exception:
             pass
 
-        # Optional: Direct project URL
         url = f"https://app.gocatalant.com/c/_/u/0/need/{project_id}/"
         try:
             link = card.find_element(By.CSS_SELECTOR, "a[href*='need']")
             href = link.get_attribute("href") or ""
             if href and "need" in href:
                 url = href
-        except:
+        except Exception:
             pass
 
-        return {
+        scraped_at = datetime.now(timezone.utc)
+        source_posted_at = None
+        source_posted_at_is_estimated = False
+        if time_posted and time_posted != "Unknown":
+            parsed, estimated = extraction.parse_relative_posted_time(time_posted, scraped_at)
+            if parsed is not None:
+                source_posted_at = parsed.isoformat()
+                source_posted_at_is_estimated = estimated
+
+        project = {
             "id": project_id,
+            "project_id": project_id,
+            "platform": PLATFORM,
             "title": title,
-            "description": description,
-            "location": location,
-            "budget": budget,
-            "duration": duration,
-            "platform_category": platform_category,
+            "short_description": description or None,
+            "description": None,  # full description comes from detail page
+            "location": location or None,
+            "budget": budget or None,
+            "budget_text": budget_fields.get("budget_text") or (budget or None),
+            "budget_min": budget_fields.get("budget_min"),
+            "budget_max": budget_fields.get("budget_max"),
+            "budget_currency": budget_fields.get("budget_currency"),
+            "billing_type": budget_fields.get("billing_type"),
+            "hourly_rate": budget_fields.get("hourly_rate"),
+            "daily_rate": budget_fields.get("daily_rate"),
+            "rate_currency": budget_fields.get("rate_currency"),
+            "budget_source": budget_fields.get("budget_source"),
+            "budget_confidence": budget_fields.get("budget_confidence"),
+            "duration": duration or None,
+            "duration_text": duration or None,
+            "platform_category": category_info.get("platform_category"),
+            "platform_category_path": category_info.get("platform_category_path") or [],
+            "platform_category_raw": category_info.get("platform_category_raw"),
+            "platform_category_source": category_info.get("platform_category_source"),
+            "platform_category_confidence": category_info.get("platform_category_confidence"),
+            "platform_category_extraction_status": category_info.get(
+                "platform_category_extraction_status"
+            ),
             "time_posted": time_posted,
+            "time_posted_text": time_posted,
+            "source_posted_at": source_posted_at,
+            "source_posted_at_is_estimated": source_posted_at_is_estimated,
             "status": status,
             "url": url,
-            "detected_at": datetime.now(PKT).strftime("%Y-%m-%d %H:%M:%S")
+            "source_url": url,
+            "detail_extraction_status": "NOT_ATTEMPTED",
+            "detected_at": datetime.now(PKT).strftime("%Y-%m-%d %H:%M:%S"),
+            "raw_data": {"card_time_posted": time_posted},
+            "extraction_warnings": list(budget_fields.get("extraction_warnings") or []),
         }
-    except:
+        if not description:
+            # Optional card summary — do not fail card for missing optional field
+            pass
+        project["card_extraction_status"] = extraction.calculate_card_extraction_status(project)
+        project["missing_fields"] = extraction.compute_missing_fields(
+            project, expected_fields=list(extraction.CARD_REQUIRED_FIELDS)
+        )
+        return project
+    except Exception:
         return None
+
 
 def scan_for_projects(driver):
     """Scan Search Projects page for project cards - returns only valid projects.
@@ -1074,445 +1231,334 @@ def scan_for_projects(driver):
         return []
 
 # ============================
-# PROJECT DATABASE (MongoDB)
+# PROJECT DATABASE (Supabase)
 # ============================
-_projects_client = None
-
-def _get_collection():
-    """Return the MongoDB projects collection, reusing the client across calls."""
-    global _projects_client
-    try:
-        if _projects_client is None:
-            _projects_client = MongoClient(Config.MONGO_URI)
-        return _projects_client["office_monitor"]["projects"]
-    except Exception as e:
-        print(f"⚠️ MongoDB connection failed: {redact_sensitive_text(e)}")
-        send_error_notification(
-            "DATABASE:INITIALIZATION_FAILED",
-            e,
-            details="database=office_monitor collection=projects",
-            traceback_text=traceback.format_exc(),
-            diagnostics={"database": "office_monitor", "collection": "projects", "operation": "connect"},
-        )
-        raise
-
-def _normalize_posted_date(time_str):
-    """Normalize a posted-date string to MM/DD/YYYY, or '' if no absolute date found."""
-    if not time_str:
-        return ""
-    s = str(time_str).strip()
-    m = re.search(r'(\d{1,2})/(\d{1,2})/(\d{4})', s)
-    if m:
-        return f"{int(m.group(1)):02d}/{int(m.group(2)):02d}/{m.group(3)}"
-    m = re.search(r'(\d{4})-(\d{2})-(\d{2})', s)
-    if m:
-        return f"{int(m.group(2)):02d}/{int(m.group(3)):02d}/{m.group(1)}"
-    return ""
-
-
-def _parse_posted_date(time_str):
-    """Return a calendar date for an absolute posted-date value, or None.
-    Relative strings like '2 hours' are intentionally not converted to dates.
-    """
-    normalized = _normalize_posted_date(time_str)
-    if not normalized:
-        return None
-    try:
-        return datetime.strptime(normalized, "%m/%d/%Y").date()
-    except ValueError:
-        return None
-
-
-def make_dedupe_key(project_id, time_posted):
-    """Unique occurrence key; project_id itself remains non-unique."""
-    if not project_id:
-        return ""
-    date = _normalize_posted_date(time_posted)
-    return f"{project_id}|{date}" if date else str(project_id)
-
-
 def init_db():
-    """Ensure unique sparse index on dedupe_key; non-unique on project_id.
-    Drops legacy unique project_id index so re-posts can insert new rows.
-    """
-    coll = _get_collection()
-    try:
-        coll.drop_index("idx_project_id_unique")
-        print("  DB: dropped legacy unique index on project_id (re-posts now allowed)")
-    except Exception:
-        pass
-    try:
-        coll.create_index(
-            "dedupe_key", unique=True, sparse=True, name="idx_dedupe_key_unique"
-        )
-        coll.create_index("project_id", name="idx_project_id")
-    except Exception as e:
-        msg = str(e).lower()
-        if "already exists" in msg or "indexoptionsconflict" in msg or "equivalent index" in msg:
-            return
-        print(f"⚠️ Index creation issue: {redact_sensitive_text(e)}")
-        send_error_notification(
-            "DATABASE:INDEX_CREATION_FAILED",
-            e,
-            details="indexes=idx_dedupe_key_unique,idx_project_id",
-            traceback_text=traceback.format_exc(),
-            diagnostics={
-                "database": "office_monitor",
-                "collection": "projects",
-                "operation": "create_index",
-            },
-        )
+    """Validate Supabase connectivity and required schema."""
+    db.ensure_schema_ready()
 
 
 def db_is_cold_start():
-    """True if the collection has no documents (first ever run)."""
-    return _get_collection().find_one({}, {"_id": 1}) is None
+    """True when this platform has no projects rows yet."""
+    return not db.platform_has_projects(PLATFORM)
 
 
-def get_project_history():
-    """Return (seen_keys, known_ids, latest_by_id) from MongoDB.
-    Raises on failure so the monitor never treats DB as empty by mistake.
-    """
-    try:
-        docs = _get_collection().find(
-            {}, {"project_id": 1, "time_posted": 1, "dedupe_key": 1, "_id": 0}
-        )
-        keys = set()
-        known_ids = set()
-        latest_by_id = {}
-        for d in docs:
-            project_id = d.get("project_id")
-            if not project_id:
-                continue
-            known_ids.add(project_id)
-
-            key = d.get("dedupe_key") or make_dedupe_key(
-                project_id, d.get("time_posted")
-            )
-            if key:
-                keys.add(key)
-
-            posted_date = _parse_posted_date(d.get("time_posted"))
-            current_latest = latest_by_id.get(project_id)
-            if posted_date and (current_latest is None or posted_date > current_latest):
-                latest_by_id[project_id] = posted_date
-        return keys, known_ids, latest_by_id
-    except Exception as e:
-        print(f"⚠️ DB project-history load failed: {redact_sensitive_text(e)}")
-        send_error_notification(
-            "DATABASE:PROJECT_LOOKUP_FAILED",
-            e,
-            details="operation=get_project_history",
-            traceback_text=traceback.format_exc(),
-            diagnostics={
-                "database": "office_monitor",
-                "collection": "projects",
-                "operation": "lookup",
-            },
-        )
-        raise
+def should_process_project(project_id, now=None):
+    return db.should_process_project(PLATFORM, project_id, now=now)
 
 
-def get_seen_ids():
-    """Compatibility helper returning occurrence keys already in DB."""
-    return get_project_history()[0]
+def notify_db_error(context, error, *, project_id=None, operation=None):
+    send_error_notification(
+        context,
+        error,
+        details=(
+            f"operation={operation or context}\n"
+            f"platform={PLATFORM}\n"
+            f"project_id={project_id or '-'}\n"
+            f"table=projects"
+        ),
+        traceback_text=traceback.format_exc(),
+        diagnostics={
+            "database": "supabase",
+            "platform": PLATFORM,
+            "project_id": project_id,
+            "operation": operation or context,
+        },
+    )
 
-
-def insert_project(project, emailed=True):
-    """Upsert one project record keyed on dedupe_key (id + posted date)."""
-    try:
-        cat = (project.get("platform_category") or "").strip()
-        doc = {
-            "dedupe_key":         make_dedupe_key(project.get("id"), project.get("time_posted")),
-            "project_id":         project.get("id"),
-            "title":              project.get("title"),
-            "description":        project.get("description"),
-            "location":           project.get("location"),
-            "budget":             project.get("budget"),
-            "duration":           project.get("duration"),
-            "start_date":         project.get("start_date"),
-            "project_length":     project.get("project_length"),
-            "location_pref":      project.get("location_pref"),
-            "level_of_support":   project.get("level_of_support"),
-            "industry":           project.get("industry"),
-            "contracting":        project.get("contracting"),
-            "time_posted":        project.get("time_posted"),
-            "status":             project.get("status"),
-            "url":                project.get("url"),
-            "detected_at":        project.get("detected_at"),
-            "platform":           "catalant",
-            "emailed":            bool(emailed),
-        }
-        if not doc["dedupe_key"]:
-            print("⚠️ DB insert skipped — missing dedupe_key / project_id")
-            return
-        # Always $set platform_category so the field exists even when scrape misses.
-        update = {"$setOnInsert": dict(doc), "$set": {"platform_category": cat}}
-        _get_collection().update_one(
-            {"dedupe_key": doc["dedupe_key"]},
-            update,
-            upsert=True,
-        )
-    except Exception as e:
-        msg = str(e).lower()
-        if "duplicate key" in msg or "e11000" in msg:
-            return
-        print(f"⚠️ DB insert failed: {redact_sensitive_text(e)}")
-        send_error_notification(
-            "DATABASE:PROJECT_INSERT_FAILED",
-            e,
-            details=f"project_id={project.get('id')}\nurl={project.get('url')}",
-            traceback_text=traceback.format_exc(),
-            diagnostics={
-                "database": "office_monitor",
-                "collection": "projects",
-                "operation": "insert",
-                "project_id": project.get("id"),
-                "project_url": project.get("url"),
-                "project_title": project.get("title"),
-            },
-        )
-
-
-def bulk_insert_projects(projects, emailed=False):
-    """Upsert many projects keyed on dedupe_key (cold-start seeding).
-    Returns True on success, False on failure.
-    """
-    try:
-        ops = []
-        for p in projects:
-            if not p.get("id"):
-                continue
-            cat = (p.get("platform_category") or "").strip()
-            key = make_dedupe_key(p.get("id"), p.get("time_posted"))
-            if not key:
-                continue
-            doc = {
-                "dedupe_key":        key,
-                "project_id":        p.get("id"),
-                "title":             p.get("title"),
-                "description":       p.get("description"),
-                "location":          p.get("location"),
-                "budget":            p.get("budget"),
-                "duration":          p.get("duration"),
-                "platform_category": cat,
-                "time_posted":       p.get("time_posted"),
-                "status":            p.get("status"),
-                "url":               p.get("url"),
-                "detected_at":       p.get("detected_at"),
-                "platform":          "catalant",
-                "emailed":           bool(emailed),
-            }
-            # For seed inserts, keep platform_category in $setOnInsert only to
-            # avoid path conflicts; also $set when we have a non-empty value.
-            update = {"$setOnInsert": dict(doc)}
-            if cat:
-                # Cannot put same path in both ops — drop from setOnInsert when setting
-                insert_doc = dict(doc)
-                insert_doc.pop("platform_category", None)
-                update = {
-                    "$setOnInsert": insert_doc,
-                    "$set": {"platform_category": cat},
-                }
-            ops.append(UpdateOne({"dedupe_key": key}, update, upsert=True))
-        if ops:
-            result = _get_collection().bulk_write(ops, ordered=False)
-            print(
-                f"  DB: inserted {result.upserted_count} records "
-                f"(emailed={'yes' if emailed else 'no'})"
-            )
-        return True
-    except Exception as e:
-        msg = str(e).lower()
-        if "duplicate key" in msg or "e11000" in msg:
-            return True
-        print(f"⚠️ DB bulk insert failed: {redact_sensitive_text(e)}")
-        send_error_notification(
-            "DATABASE:BULK_INSERT_FAILED",
-            e,
-            details=f"record_count={len(projects)}",
-            traceback_text=traceback.format_exc(),
-            diagnostics={
-                "database": "office_monitor",
-                "collection": "projects",
-                "operation": "bulk_insert",
-                "record_count": len(projects),
-            },
-        )
-        return False
-
-
-def parse_posted_minutes(time_str):
-    """Convert a scraped 'time_posted' string into minutes. Returns None if unparseable."""
-    if not time_str or time_str == "Unknown":
-        return None
-    s = time_str.lower().strip()
-    if any(w in s for w in ("just", "moment", "second")):
-        return 0
-    match = re.search(r'(\d+)\s*(minute|hour|day|week|month)', s)
-    if not match:
-        return None
-    val, unit = int(match.group(1)), match.group(2)
-    return val * {"minute": 1, "hour": 60, "day": 1440, "week": 10080, "month": 43200}[unit]
-
-
-def filter_new_projects(all_projects, seen_ids, known_ids=None, latest_by_id=None):
-    """Keep first-seen IDs and re-posts newer than REPOST_MIN_DAYS.
-
-    project_id is the conditional lookup key. dedupe_key is the unique occurrence key.
-    Relative posted strings for known IDs are skipped (no invented date gaps).
-    """
-    known_ids = known_ids if known_ids is not None else set()
-    latest_by_id = latest_by_id if latest_by_id is not None else {}
-    comparison_keys = set(seen_ids)
-    comparison_ids = set(known_ids)
-    comparison_latest = dict(latest_by_id)
-    result = []
-    for p in all_projects:
-        project_id = p.get("id")
-        if not project_id:
-            continue
-
-        posted_value = p.get("time_posted", "")
-        key = make_dedupe_key(project_id, posted_value)
-        if key in comparison_keys:
-            continue
-
-        current_date = _parse_posted_date(posted_value)
-        if project_id not in comparison_ids:
-            result.append(p)
-            comparison_keys.add(key)
-            comparison_ids.add(project_id)
-            if current_date:
-                comparison_latest[project_id] = current_date
-            continue
-
-        latest_date = comparison_latest.get(project_id)
-        if current_date is None or latest_date is None:
-            print(
-                f"  Skipping known project {project_id}: "
-                "posted date cannot be compared safely"
-            )
-            continue
-
-        gap_days = (current_date - latest_date).days
-        if gap_days > Config.REPOST_MIN_DAYS:
-            result.append(p)
-            comparison_keys.add(key)
-            comparison_latest[project_id] = current_date
-        else:
-            print(
-                f"  Skipping project {project_id}: repost gap is "
-                f"{gap_days} day(s), requires > {Config.REPOST_MIN_DAYS}"
-            )
-    return result
 
 # ============================
 # DETAIL PAGE FETCH
 # ============================
-def fetch_project_details(driver, url):
-    """Navigate to a Catalant project detail page and extract full information."""
-    details = {}
+def classify_detail_page(driver, url=""):
+    """Return classification for wrong/empty detail pages."""
     try:
-        driver.get(url)
+        current = (driver.current_url or "").lower()
+    except Exception:
+        current = ""
+    try:
+        title = (driver.title or "").lower()
+    except Exception:
+        title = ""
+    text = (_safe_page_text(driver, 2500) or "").lower()
+    blob = f"{current} {title} {text}"
+    if "login" in current or "sign in" in text[:500]:
+        return "DETAIL_PAGE_LOGIN_REDIRECT"
+    if any(tok in blob for tok in ("access denied", "forbidden", "not authorized")):
+        return "DETAIL_PAGE_ACCESS_DENIED"
+    if any(tok in blob for tok in ("not found", "page doesn't exist", "doesn't exist")):
+        return "DETAIL_PAGE_NOT_FOUND"
+    if "/search/" in current and "/need/" not in current:
+        return "DETAIL_PAGE_SEARCH_INSTEAD"
+    if len(text.strip()) < 80:
+        return "DETAIL_PAGE_EMPTY_SHELL"
+    return None
 
-        # Wait for the structured fields to appear (JS-heavy SPA needs time)
+
+def wait_for_project_detail_page(driver, timeout=25):
+    """Wait for verified Catalant detail indicators (not only sleep)."""
+    end = time.time() + timeout
+    last_err = None
+
+    def _detail_ready(drv):
+        bad = classify_detail_page(drv)
+        if bad in (
+            "DETAIL_PAGE_LOGIN_REDIRECT",
+            "DETAIL_PAGE_ACCESS_DENIED",
+            "DETAIL_PAGE_NOT_FOUND",
+            "DETAIL_PAGE_SEARCH_INSTEAD",
+        ):
+            raise TimeoutException(bad)
+        body = ""
         try:
-            WebDriverWait(driver, 20).until(
-                EC.presence_of_element_located((By.XPATH,
-                    "//*[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'contracting')]"
-                ))
-            )
-        except TimeoutException:
-            time.sleep(8)
-
-        # Try CSS selectors for full description
-        for sel in [".need-description", ".description-body", "[class*='description-body']",
-                    ".need-detail-description", ".project-description", "[class*='need-description']"]:
+            body = (drv.find_element(By.TAG_NAME, "body").text or "").lower()
+        except Exception:
+            return False
+        markers = (
+            "contracting process",
+            "project logistics",
+            "project budget",
+            "expert preferences",
+            "start date:",
+            "timeline:",
+        )
+        if any(m in body for m in markers):
+            return True
+        for sel in (
+            ".need-description",
+            ".description-body",
+            "[class*='need-description']",
+        ):
             try:
-                el = driver.find_element(By.CSS_SELECTOR, sel)
-                t = el.text.strip()
-                if len(t) > 50:
-                    details["description"] = t
+                if drv.find_elements(By.CSS_SELECTOR, sel):
+                    return True
+            except Exception:
+                pass
+        return False
+
+    while time.time() < end:
+        try:
+            WebDriverWait(driver, 3).until(_detail_ready)
+            time.sleep(1.2)  # brief stabilize
+            return True
+        except TimeoutException as e:
+            last_err = e
+            if str(e).startswith("DETAIL_PAGE_"):
+                raise
+            time.sleep(0.5)
+        except Exception as e:
+            last_err = e
+            time.sleep(0.5)
+    raise TimeoutException(str(last_err or "DETAIL_PAGE_TIMEOUT"))
+
+
+def fetch_project_details(driver, url, *, title="", max_attempts=None):
+    """Navigate to a Catalant project detail page and extract full information."""
+    max_attempts = max_attempts or Config.DETAIL_MAX_ATTEMPTS
+    details = {
+        "detail_extraction_status": "NOT_ATTEMPTED",
+        "detail_attempt_count": 0,
+        "extraction_warnings": [],
+        "extraction_metadata": {},
+    }
+    last_error = None
+    for attempt in range(1, max_attempts + 1):
+        details["detail_attempt_count"] = attempt
+        details["detail_last_attempt_at"] = db._iso()
+        try:
+            driver.get(url)
+            wait_for_project_detail_page(driver)
+            bad = classify_detail_page(driver, url)
+            if bad:
+                details["detail_extraction_status"] = "FAILED"
+                details["detail_failure_code"] = bad
+                details["detail_last_error"] = bad
+                details["extraction_warnings"] = list(set((details.get("extraction_warnings") or []) + [bad]))
+                details.setdefault("extraction_metadata", {})["retries"] = attempt
+                last_error = bad
+                if attempt < max_attempts:
+                    continue
+                return details
+
+            # Expand truncated Project Description ("More")
+            try:
+                for xpath in (
+                    "//a[normalize-space()='More' or contains(normalize-space(),'More')]",
+                    "//button[normalize-space()='More' or contains(normalize-space(),'More')]",
+                    "//*[self::a or self::button][contains(@class,'more')]",
+                ):
+                    links = driver.find_elements(By.XPATH, xpath)
+                    for el in links:
+                        try:
+                            txt = (el.text or "").strip().lower()
+                            if txt in ("more", "show more", "read more") or txt.endswith("more"):
+                                if el.is_displayed():
+                                    driver.execute_script("arguments[0].click();", el)
+                                    time.sleep(0.9)
+                                    break
+                        except Exception:
+                            continue
+                    else:
+                        continue
                     break
             except Exception:
                 pass
 
-        body_text = driver.find_element(By.TAG_NAME, "body").text
-        # Normalize non-breaking spaces and Windows line endings
-        body_text = body_text.replace('\u00a0', ' ').replace('\r\n', '\n').replace('\r', '\n')
+            # Prefer dedicated description container when present
+            desc_from_dom = ""
+            for sel in (
+                ".need-description",
+                ".description-body",
+                "[class*='description-body']",
+                ".need-detail-description",
+                ".project-description",
+                "[class*='need-description']",
+                "[class*='project-description']",
+            ):
+                try:
+                    el = driver.find_element(By.CSS_SELECTOR, sel)
+                    t = extraction.normalize_visible_text(el.text)
+                    if len(t) > 50 and extraction.validate_extracted_value(t, title=title):
+                        desc_from_dom = t
+                        break
+                except Exception:
+                    pass
 
-        # Fallback: extract description from body text between section headers
-        if not details.get("description"):
-            m = re.search(
-                r'(?:Summary\s*\n+)?Description\s*\n([\s\S]+?)(?=\n(?:Project Logistics|Budget|Expert Preferences|Contracting|Other Details)|\Z)',
-                body_text, re.IGNORECASE
-            )
-            if m:
-                txt = m.group(1).strip()
-                if len(txt) > 30:
-                    details["description"] = txt
+            # Fallback: section under "Project Description" heading via XPath
+            if not desc_from_dom:
+                try:
+                    heading = driver.find_element(
+                        By.XPATH,
+                        "//*[self::h1 or self::h2 or self::h3 or self::h4 or self::div]"
+                        "[contains(normalize-space(),'Project Description')]",
+                    )
+                    parent = heading.find_element(By.XPATH, "./ancestor::*[self::section or self::div][1]")
+                    t = extraction.normalize_visible_text(parent.text)
+                    # Strip the heading itself
+                    t = re.sub(r"(?i)^project description\s*", "", t).strip()
+                    if len(t) > 50 and extraction.validate_extracted_value(t, title=title):
+                        desc_from_dom = t
+                except Exception:
+                    pass
 
-        # ── Inline "Label: Value" extraction ─────────────────────────────────
-        # The detail page renders all fields as "Label: Value" on a single line.
-        inline_patterns = [
-            ("start_date",       r'Start Date:\s*(.+)'),
-            ("project_length",   r'Timeline:\s*(.+)'),          # page uses "Timeline"
-            ("level_of_support", r'(?:Expert Type|Level of Support):\s*(.+)|^(Independent Expert|Open to Both|Consulting Firm|Both)$'),
-            ("industry",         r'Industry:\s*(.+)'),           # page uses "Industry"
-            ("contracting",      r'Contracting Process:\s*(.+)'),
-        ]
-        for field, pattern in inline_patterns:
-            if details.get(field):
-                continue
-            m = re.search(pattern, body_text, re.IGNORECASE | re.MULTILINE)
-            if m:
-                # Handle alternation groups — pick first non-None group
-                val = next((g for g in m.groups() if g), None) if m.groups() else m.group(0)
-                if val:
-                    val = val.strip()
-                    if val:
-                        details[field] = val
+            body_text = driver.find_element(By.TAG_NAME, "body").text
+            body_text = extraction.normalize_visible_text(body_text).replace("\n ", "\n")
+            # Keep newlines for section parsing
+            body_text = body_text.replace("\u00a0", " ")
 
-        # Location: two "Location:" lines exist — description prose (first) and
-        # the structured sidebar (last). Always take the LAST occurrence.
-        if not details.get("location_pref"):
-            matches = re.findall(r'^Location:\s*(.+)', body_text, re.IGNORECASE | re.MULTILINE)
-            if matches:
-                details["location_pref"] = matches[-1].strip()
+            parsed = extraction.extract_detail_fields_from_body(body_text, title=title)
+            if desc_from_dom:
+                parsed["description"] = desc_from_dom
+                meta = parsed.get("extraction_metadata") or {}
+                extracted = list(meta.get("fields_extracted") or [])
+                if "description" not in extracted:
+                    extracted.append("description")
+                visible = list(meta.get("fields_visible_on_page") or [])
+                if "description" not in visible:
+                    visible.append("description")
+                # Remove from missing/not_exposed if present
+                meta["fields_missing_but_visible"] = [
+                    f for f in (meta.get("fields_missing_but_visible") or []) if f != "description"
+                ]
+                meta["fields_not_exposed"] = [
+                    f for f in (meta.get("fields_not_exposed") or []) if f != "description"
+                ]
+                meta["fields_extracted"] = extracted
+                meta["fields_visible_on_page"] = visible
+                parsed["extraction_metadata"] = meta
+                parsed["detail_extraction_status"] = extraction.calculate_detail_extraction_status(
+                    attempted=True,
+                    page_ok=True,
+                    fields_visible=visible,
+                    fields_extracted=extracted,
+                    meaningful=True,
+                )
+                parsed["missing_fields"] = [
+                    f for f in visible if f not in extracted
+                ]
 
-        # Budget: "Project Budget:\n<value>" — value is on the NEXT line.
-        # Use [ \t]* (not \s*) before \n to avoid eating the newline itself.
-        if not details.get("detail_budget"):
-            m = re.search(r'Project Budget:[ \t]*\n[ \t]*(.+)', body_text, re.IGNORECASE)
-            if m:
-                val = m.group(1).strip()
-                if val and val.lower() != "not provided":
-                    details["detail_budget"] = val
+            # Category from DOM/body (preserve working extractor)
+            if not parsed.get("platform_category"):
+                cat_info = extract_platform_category(driver, body_text)
+                parsed.update(cat_info)
+                if parsed.get("platform_category"):
+                    print(
+                        f"      platform_category → {parsed['platform_category']} "
+                        f"({parsed.get('platform_category_extraction_status')})"
+                    )
+                else:
+                    print(
+                        f"      ⚠️ platform_category "
+                        f"{parsed.get('platform_category_extraction_status') or 'MISSING'}"
+                    )
 
-        # Platform Category: first segment of "A > B > C" breadcrumb on detail page
-        if not details.get("platform_category"):
-            details["platform_category"] = _extract_platform_category(driver, body_text)
-            if details.get("platform_category"):
-                print(f"      platform_category → {details['platform_category']}")
-            else:
-                print("      ⚠️ platform_category not found on detail page")
-
-    except Exception as e:
-        print(f"  ⚠️ Detail fetch failed: {redact_sensitive_text(e)}")
-        ctx = "PROJECT_DETAIL:TIMEOUT" if isinstance(e, TimeoutException) else "PROJECT_DETAIL:FETCH_FAILED"
-        send_error_notification(
-            ctx,
-            e,
-            details=f"url={url}",
-            traceback_text=traceback.format_exc(),
-            diagnostics={
-                **_safe_driver_info(driver),
-                "project_url": url,
-                "operation": "fetch_project_details",
-            },
-        )
+            details.update(parsed)
+            details["detail_failure_code"] = None
+            details["detail_last_error"] = None
+            details["detail_completed_at"] = db._iso()
+            details.setdefault("extraction_metadata", {})["detail_attempts"] = attempt
+            return details
+        except TimeoutException as e:
+            last_error = e
+            code = str(e)
+            if not code.startswith("DETAIL_PAGE_"):
+                code = "DETAIL_PAGE_TIMEOUT"
+            print(f"  ⚠️ Detail fetch timeout (attempt {attempt}): {redact_sensitive_text(e)}")
+            details["detail_extraction_status"] = "TIMEOUT"
+            details["detail_failure_code"] = code
+            details["detail_last_error"] = redact_sensitive_text(e)[:500]
+            details["extraction_warnings"] = list(set((details.get("extraction_warnings") or []) + [code]))
+            if attempt >= max_attempts:
+                send_error_notification(
+                    "PROJECT_DETAIL:TIMEOUT",
+                    e,
+                    details=f"url={url}\nattempt={attempt}",
+                    traceback_text=traceback.format_exc(),
+                    diagnostics={
+                        **_safe_driver_info(driver),
+                        "project_url": url,
+                        "operation": "fetch_project_details",
+                    },
+                )
+        except Exception as e:
+            last_error = e
+            print(f"  ⚠️ Detail fetch failed (attempt {attempt}): {redact_sensitive_text(e)}")
+            details["detail_extraction_status"] = "FAILED"
+            details["detail_failure_code"] = "DETAIL_FETCH_FAILED"
+            details["detail_last_error"] = redact_sensitive_text(e)[:500]
+            details["extraction_warnings"] = list(set(
+                (details.get("extraction_warnings") or []) + ["DETAIL_FETCH_FAILED"]
+            ))
+            if attempt >= max_attempts:
+                send_error_notification(
+                    "PROJECT_DETAIL:FETCH_FAILED",
+                    e,
+                    details=f"url={url}\nattempt={attempt}",
+                    traceback_text=traceback.format_exc(),
+                    diagnostics={
+                        **_safe_driver_info(driver),
+                        "project_url": url,
+                        "operation": "fetch_project_details",
+                    },
+                )
+        if attempt < max_attempts:
+            time.sleep(1)
+    if last_error and not details.get("detail_extraction_status"):
+        details["detail_extraction_status"] = "FAILED"
     return details
+
+
+def enrich_project_with_details(driver, project, *, delay=None):
+    """Fetch details for a card dict and merge. Returns merged project."""
+    url = project.get("source_url") or project.get("url")
+    title = project.get("title") or ""
+    details = fetch_project_details(driver, url, title=title)
+    merged = extraction.merge_project_data(project, details)
+    if delay is None:
+        delay = Config.DETAIL_FETCH_DELAY_SECONDS
+    if delay and delay > 0:
+        time.sleep(delay)
+    return merged, details
 
 
 # ============================
@@ -1547,17 +1593,17 @@ def _row(label, value, alt=False, bold_value=False):
 
 def create_email_html(project):
     title         = project.get('title', 'Untitled Project')
-    url           = project.get('url', 'https://app.gocatalant.com/c/_/u/0/dashboard/')
-    time_posted   = project.get('time_posted', '')
+    url           = project.get('url') or project.get('source_url') or 'https://app.gocatalant.com/c/_/u/0/dashboard/'
+    time_posted   = project.get('time_posted') or project.get('time_posted_text') or ''
     status        = project.get('status', '')
     detected_at   = project.get('detected_at', '')
-    project_id    = project.get('id', '')
+    project_id    = project.get('id') or project.get('project_id') or ''
     description   = project.get('description', '')
-    start_date    = project.get('start_date', '')
-    proj_length   = project.get('project_length', '') or project.get('duration', '')
-    location_pref = project.get('location_pref', '') or project.get('location', '')
-    contracting   = project.get('contracting', '')
-    budget        = project.get('budget', '') or project.get('detail_budget', '') or 'Not provided'
+    start_date    = project.get('start_date') or project.get('start_date_text') or ''
+    proj_length   = project.get('project_length', '') or project.get('duration', '') or project.get('duration_text', '')
+    location_pref = project.get('location_pref', '') or project.get('location_preference', '') or project.get('location', '')
+    contracting   = project.get('contracting', '') or project.get('contracting_process', '')
+    budget        = project.get('budget', '') or project.get('budget_text', '') or project.get('detail_budget', '') or 'Not provided'
     support_level = project.get('level_of_support', '')
     industry      = project.get('industry', '')
 
@@ -1657,44 +1703,203 @@ def create_email_html(project):
   </div>
 </body></html>"""
 
+def classify_email_failure(error):
+    msg = str(error or "").lower()
+    if "auth" in msg or "login" in msg or "credential" in msg:
+        return "SMTP_AUTH_FAILED"
+    if "timeout" in msg:
+        return "SMTP_TIMEOUT"
+    if "recipient" in msg or "mailbox" in msg:
+        return "SMTP_RECIPIENT_REJECTED"
+    return "EMAIL_SEND_FAILED"
+
+
 def send_notification(project):
-    """Send email notification for a new project"""
+    """Send email notification for a new project.
+
+    Returns dict: {ok, message_id, error, failure_code}.
+    """
     try:
         msg = MIMEMultipart("alternative")
         msg["Subject"] = f"🔔 Catalant: {project.get('title', 'New Project')}"
         msg["From"] = Config.SENDER_EMAIL
         msg["To"] = ", ".join(Config.RECIPIENT_EMAILS)
-        
+        msg_id_header = msg["Message-ID"] if msg["Message-ID"] else None
+
         msg.attach(MIMEText(create_email_html(project), "html"))
-        
+
         with smtplib.SMTP(Config.SMTP_SERVER, Config.SMTP_PORT) as server:
             server.starttls()
             server.login(Config.SENDER_EMAIL, Config.SENDER_PASSWORD)
             server.send_message(msg)
-        
+            try:
+                msg_id_header = msg["Message-ID"]
+            except Exception:
+                pass
+
         print(f"📧 Email sent: {project.get('title', 'Unknown')[:50]}...")
-        return True
+        return {
+            "ok": True,
+            "message_id": msg_id_header,
+            "error": None,
+            "failure_code": None,
+        }
     except Exception as e:
         print(f"❌ Email failed: {redact_sensitive_text(e)}")
+        code = classify_email_failure(e)
         send_error_notification(
             "PROJECT_EMAIL:SEND_FAILED",
             e,
             details=(
-                f"project_id={project.get('id')}\n"
+                f"project_id={project.get('id') or project.get('project_id')}\n"
                 f"title={project.get('title')}\n"
-                f"url={project.get('url')}\n"
+                f"url={project.get('url') or project.get('source_url')}\n"
                 f"recipients={', '.join(Config.RECIPIENT_EMAILS)}\n"
                 f"smtp={Config.SMTP_SERVER}:{Config.SMTP_PORT}"
             ),
             traceback_text=traceback.format_exc(),
             diagnostics={
-                "project_id": project.get("id"),
+                "project_id": project.get("id") or project.get("project_id"),
                 "project_title": project.get("title"),
-                "project_url": project.get("url"),
+                "project_url": project.get("url") or project.get("source_url"),
                 "operation": "project_email",
+                "failure_code": code,
             },
         )
-        return False
+        return {
+            "ok": False,
+            "message_id": None,
+            "error": redact_sensitive_text(e),
+            "failure_code": code,
+        }
+
+
+def row_to_email_project(row):
+    """Map a projects table row back to the email template shape."""
+    return {
+        "id": row.get("project_id"),
+        "project_id": row.get("project_id"),
+        "title": row.get("title"),
+        "description": row.get("description") or row.get("short_description"),
+        "url": row.get("source_url"),
+        "source_url": row.get("source_url"),
+        "time_posted": row.get("time_posted_text"),
+        "status": row.get("status"),
+        "detected_at": row.get("first_detected_at") or row.get("scraped_at"),
+        "start_date": row.get("start_date_text"),
+        "project_length": row.get("project_length") or row.get("duration_text"),
+        "duration": row.get("duration_text"),
+        "location_pref": row.get("location_preference") or row.get("location"),
+        "location": row.get("location"),
+        "contracting": row.get("contracting_process"),
+        "budget": row.get("budget_text"),
+        "level_of_support": row.get("level_of_support"),
+        "industry": row.get("industry"),
+        "platform_category": row.get("platform_category"),
+    }
+
+
+def process_project_email(row, project_payload=None, dry_run=False):
+    """
+    Insert-order safe email attempt against an existing projects row.
+    Creates email_attempts, sends, updates the same projects row.
+    """
+    row_id = row["id"]
+    attempt_number = int(row.get("email_attempt_count") or 0) + 1
+    recipients = list(Config.RECIPIENT_EMAILS)
+    payload = project_payload or row_to_email_project(row)
+
+    if dry_run:
+        print(f"  [dry-run] would email project row {row_id} attempt={attempt_number}")
+        return {"ok": True, "dry_run": True}
+
+    attempt = db.record_email_attempt(
+        row_id,
+        attempt_number,
+        status="SENDING",
+        recipients=recipients,
+        provider="smtp",
+    )
+    db.update_project_email_status(
+        row_id,
+        email_status="SENDING",
+        email_last_attempt_at=db._iso(),
+    )
+    result = send_notification(payload)
+    now_iso = db._iso()
+    if result["ok"]:
+        db.record_email_attempt(
+            row_id,
+            attempt_number,
+            status="SENT",
+            attempt_id=attempt["id"],
+            message_id=result.get("message_id"),
+        )
+        updated = db.update_project_email_status(
+            row_id,
+            email_sent=True,
+            email_status="SENT",
+            email_sent_at=now_iso,
+            email_last_attempt_at=now_iso,
+            email_attempt_count=attempt_number,
+            email_not_sent_reason=None,
+            email_failure_code=None,
+            email_last_error=None,
+            email_message_id=result.get("message_id"),
+            email_next_retry_at=None,
+        )
+        return {"ok": True, "row": updated, "attempt": attempt}
+    next_retry = db.compute_email_next_retry_at(
+        attempt_number, base_minutes=Config.EMAIL_RETRY_BASE_MINUTES
+    )
+    status = (
+        "FAILED"
+        if attempt_number >= Config.EMAIL_MAX_RETRIES
+        else "RETRY_PENDING"
+    )
+    db.record_email_attempt(
+        row_id,
+        attempt_number,
+        status="FAILED",
+        attempt_id=attempt["id"],
+        failure_code=result.get("failure_code"),
+        failure_reason=result.get("error"),
+    )
+    updated = db.update_project_email_status(
+        row_id,
+        email_sent=False,
+        email_status=status,
+        email_last_attempt_at=now_iso,
+        email_attempt_count=attempt_number,
+        email_next_retry_at=db._iso(next_retry) if status == "RETRY_PENDING" else None,
+        email_not_sent_reason="EMAIL_SEND_FAILED",
+        email_failure_code=result.get("failure_code"),
+        email_last_error=result.get("error"),
+    )
+    return {"ok": False, "row": updated, "attempt": attempt, "result": result}
+
+
+def retry_pending_emails(dry_run=False, limit=20):
+    """Bounded retry worker for RETRY_PENDING project emails."""
+    rows = db.get_retryable_email_projects(
+        max_attempts=Config.EMAIL_MAX_RETRIES,
+        limit=limit,
+        platform=PLATFORM,
+    )
+    print(f"📬 Retryable emails: {len(rows)}")
+    sent = failed = 0
+    for row in rows:
+        if row.get("email_status") in ("SUPPRESSED", "NOT_REQUIRED", "SENT"):
+            continue
+        if row.get("email_not_sent_reason") == "COLD_START_SEED":
+            continue
+        outcome = process_project_email(row, dry_run=dry_run)
+        if outcome.get("ok"):
+            sent += 1
+        else:
+            failed += 1
+    return {"sent": sent, "failed": failed, "considered": len(rows)}
+
 
 # ============================
 # DRIVER INITIALIZATION
@@ -1794,6 +1999,25 @@ def initialize_driver():
 DASHBOARD_URL = "https://app.gocatalant.com/c/_/u/0/dashboard/"
 SEARCH_URL = "https://app.gocatalant.com/c/_/u/0/search/?form_name=SearchForm&enable_pagination=True&enable_facets=True&card_action_show_need=True&use_recommended=y&display_result_count=True"
 
+
+def safe_quit_driver(driver):
+    """Quit ChromeDriver without dumping urllib3/ConnectionRefused noise on Ctrl+C."""
+    if driver is None:
+        return
+    try:
+        driver.quit()
+    except (KeyboardInterrupt, ConnectionRefusedError, ConnectionError, OSError):
+        pass
+    except Exception:
+        pass
+    try:
+        process = getattr(getattr(driver, "service", None), "process", None)
+        if process is not None:
+            process.kill()
+    except Exception:
+        pass
+
+
 def _navigate_to_search(driver):
     """Navigate to Search Projects page. Loads dashboard first so the AJAX session is active."""
     driver.get(DASHBOARD_URL)
@@ -1832,7 +2056,392 @@ def setup_session(driver):
 # ============================
 # MAIN MONITORING LOOP
 # ============================
-def main():
+def process_eligible_project(driver, project, scraper_run_id, *, dry_run=False, debug_extraction=False):
+    """Eligibility already confirmed. Fetch details, insert, then email."""
+    merged, details = enrich_project_with_details(driver, project)
+    if debug_extraction:
+        print(
+            f"     category={merged.get('platform_category')!r} "
+            f"status={merged.get('platform_category_extraction_status')} "
+            f"source={merged.get('platform_category_source')}"
+        )
+        print(
+            f"     detail_status={merged.get('detail_extraction_status')} "
+            f"missing={merged.get('missing_fields')}"
+        )
+        print(f"     description_len={len(merged.get('description') or '')}")
+
+    if dry_run:
+        print(f"  [dry-run] would insert+email: {merged.get('title', '')[:60]}")
+        return {
+            "inserted": False,
+            "emailed": False,
+            "skipped": False,
+            "dry_run": True,
+            "merged": merged,
+            "details": details,
+        }
+
+    row = db.insert_project_occurrence(
+        merged,
+        scraper_run_id=scraper_run_id,
+        email_status="PENDING",
+        email_eligible=True,
+    )
+    outcome = process_project_email(row, project_payload=merged, dry_run=False)
+    return {
+        "inserted": True,
+        "emailed": bool(outcome.get("ok")),
+        "row": outcome.get("row") or row,
+        "skipped": False,
+        "merged": merged,
+        "details": details,
+    }
+
+
+def seed_cold_start(driver, projects, scraper_run_id, *, dry_run=False, debug_extraction=False):
+    """
+    Cold-start: fetch detail pages, insert SUPPRESSED rows, no emails / no email_attempts.
+    One failed detail does not abort the cycle.
+    """
+    inserted = 0
+    details_attempted = details_completed = details_failed = details_partial = 0
+    coverage_fields = (
+        "description",
+        "location_preference",
+        "budget_text",
+        "project_length",
+        "start_date_text",
+        "level_of_support",
+        "industry",
+        "contracting_process",
+        "platform_category",
+        "skills",
+        "remote_or_onsite",
+    )
+    coverage = {f: 0 for f in coverage_fields}
+    # Snapshot primitive card dicts before navigation
+    card_snapshots = [dict(p) for p in projects if p.get("id") or p.get("project_id")]
+
+    for project in card_snapshots:
+        pid = project.get("project_id") or project.get("id")
+        print(f"  → seeding {pid}: {str(project.get('title') or '')[:55]}...")
+        details_attempted += 1
+        try:
+            merged, details = enrich_project_with_details(driver, project)
+            status = (merged.get("detail_extraction_status") or "").upper()
+            if status == "COMPLETE":
+                details_completed += 1
+            elif status == "PARTIAL":
+                details_partial += 1
+                details_completed += 1  # PARTIAL still counts as attempted success path
+            elif status in ("FAILED", "TIMEOUT"):
+                details_failed += 1
+            else:
+                details_completed += 1
+            for f in coverage_fields:
+                if not extraction.is_empty_value(merged.get(f)):
+                    coverage[f] += 1
+            if debug_extraction:
+                print(
+                    f"     detail={status} desc_len={len(merged.get('description') or '')} "
+                    f"budget={merged.get('budget_text')!r} "
+                    f"missing={merged.get('missing_fields')}"
+                )
+            if dry_run:
+                print(f"  [dry-run] would seed enriched {pid}")
+                inserted += 1
+                continue
+            db.insert_project_occurrence(
+                merged,
+                scraper_run_id=scraper_run_id,
+                email_status="SUPPRESSED",
+                email_eligible=False,
+                email_sent=False,
+                email_not_sent_reason="COLD_START_SEED",
+            )
+            inserted += 1
+        except Exception as e:
+            details_failed += 1
+            print(f"  ⚠️ Seed detail failed for {pid}: {redact_sensitive_text(e)}")
+            # Still save card-only if possible
+            if dry_run:
+                continue
+            try:
+                fallback = dict(project)
+                fallback["detail_extraction_status"] = "FAILED"
+                fallback["detail_failure_code"] = "COLD_START_DETAIL_FAILED"
+                fallback["detail_last_error"] = redact_sensitive_text(e)[:500]
+                fallback["extraction_warnings"] = list(
+                    set((fallback.get("extraction_warnings") or []) + ["COLD_START_DETAIL_FAILED"])
+                )
+                fallback["card_extraction_status"] = extraction.calculate_card_extraction_status(fallback)
+                fallback["missing_fields"] = extraction.compute_missing_fields(fallback)
+                db.insert_project_occurrence(
+                    fallback,
+                    scraper_run_id=scraper_run_id,
+                    email_status="SUPPRESSED",
+                    email_eligible=False,
+                    email_sent=False,
+                    email_not_sent_reason="COLD_START_SEED",
+                )
+                inserted += 1
+            except Exception as insert_err:
+                notify_db_error(
+                    "DATABASE:COLD_START_SEED_FAILED",
+                    insert_err,
+                    project_id=pid,
+                    operation="cold_start_seed_item",
+                )
+
+    if debug_extraction:
+        total = max(details_attempted, 1)
+        print("\n--- debug extraction summary ---")
+        print(f"cards found/parsed: {len(card_snapshots)}")
+        print(f"detail pages attempted: {details_attempted}")
+        print(f"detail pages complete: {details_completed - details_partial}")
+        print(f"detail pages partial: {details_partial}")
+        print(f"detail pages failed: {details_failed}")
+        print("field-level extraction coverage:")
+        for f in coverage_fields:
+            print(f"  {f}: {coverage[f]}/{details_attempted}")
+
+    return {
+        "inserted": inserted,
+        "details_attempted": details_attempted,
+        "details_completed": details_completed,
+        "details_failed": details_failed,
+        "details_partial": details_partial,
+        "field_coverage": coverage,
+    }
+
+
+def run_monitoring_cycle(
+    driver,
+    *,
+    cold_start_pending,
+    dry_run=False,
+    debug_extraction=False,
+    run_once=False,
+):
+    """One scan cycle. Returns updated cold_start_pending flag."""
+    run = None
+    counts = {
+        "cards_found": 0,
+        "cards_parsed": 0,
+        "cards_failed": 0,
+        "details_attempted": 0,
+        "details_completed": 0,
+        "details_failed": 0,
+        "projects_inserted": 0,
+        "projects_skipped": 0,
+        "emails_sent": 0,
+        "emails_failed": 0,
+        "emails_suppressed": 0,
+    }
+    partial = False
+    try:
+        if not dry_run:
+            try:
+                db.mark_stale_running_runs(PLATFORM)
+            except Exception as stale_err:
+                print(f"  ⚠️ Stale-run cleanup skipped: {redact_sensitive_text(stale_err)}")
+            run = db.create_scraper_run(platform=PLATFORM)
+        else:
+            run = {"id": None}
+            print("  [dry-run] scraper_run not persisted")
+
+        _navigate_to_search(driver)
+        all_projects = scan_for_projects(driver)
+        counts["cards_found"] = len(all_projects)
+        counts["cards_parsed"] = len(all_projects)
+
+        if not all_projects:
+            print("⚠️ No projects found")
+            if run and run.get("id") and not dry_run:
+                db.complete_scraper_run(run["id"], status="PARTIAL", **counts)
+            return cold_start_pending
+
+        if cold_start_pending:
+            print("⚙️  Seeding first successful scan (detail fetch ON, emails suppressed)...")
+            try:
+                seed_stats = seed_cold_start(
+                    driver,
+                    all_projects,
+                    run.get("id") if run else None,
+                    dry_run=dry_run,
+                    debug_extraction=debug_extraction,
+                )
+                counts["projects_inserted"] = seed_stats["inserted"]
+                counts["emails_suppressed"] = seed_stats["inserted"]
+                counts["details_attempted"] = seed_stats["details_attempted"]
+                counts["details_completed"] = seed_stats["details_completed"]
+                counts["details_failed"] = seed_stats["details_failed"]
+                if seed_stats["inserted"] <= 0 and not dry_run:
+                    raise RuntimeError("Cold-start produced zero seeded rows")
+                if run and run.get("id") and not dry_run:
+                    status = "PARTIAL" if seed_stats["details_failed"] else "COMPLETED"
+                    db.complete_scraper_run(run["id"], status=status, **counts)
+                print(
+                    f"✅ Seeded {seed_stats['inserted']} existing project(s) "
+                    f"(details ok={seed_stats['details_completed']} "
+                    f"failed={seed_stats['details_failed']}). "
+                    "Only qualifying future posts will trigger emails.\n"
+                )
+                return False
+            except Exception as seed_err:
+                notify_db_error(
+                    "DATABASE:COLD_START_SEED_FAILED",
+                    seed_err,
+                    operation="cold_start_seed",
+                )
+                if run and run.get("id") and not dry_run:
+                    db.fail_scraper_run(
+                        run["id"],
+                        "COLD_START_SEED_FAILED",
+                        redact_sensitive_text(seed_err),
+                        **counts,
+                    )
+                print(
+                    "⚠️  Initial seed was not confirmed; project emails remain "
+                    "suppressed and seeding will retry next cycle.\n"
+                )
+                return True
+
+        # Failed-email retries (same row, no new occurrence)
+        try:
+            retry_stats = retry_pending_emails(dry_run=dry_run)
+            counts["emails_sent"] += retry_stats.get("sent", 0)
+            counts["emails_failed"] += retry_stats.get("failed", 0)
+        except Exception as retry_err:
+            partial = True
+            print(f"  ⚠️ Email retry worker failed: {redact_sensitive_text(retry_err)}")
+            notify_db_error(
+                "DATABASE:EMAIL_RETRY_FAILED",
+                retry_err,
+                operation="retry_pending_emails",
+            )
+
+        new_count = 0
+        for project in all_projects:
+            project_id = project.get("project_id") or project.get("id")
+            if not project_id:
+                counts["cards_failed"] += 1
+                partial = True
+                continue
+            try:
+                eligible, reason, latest = should_process_project(project_id)
+            except Exception as lookup_err:
+                partial = True
+                notify_db_error(
+                    "DATABASE:PROJECT_LOOKUP_FAILED",
+                    lookup_err,
+                    project_id=project_id,
+                    operation="should_process_project",
+                )
+                raise
+
+            if not eligible:
+                counts["projects_skipped"] += 1
+                age_note = reason
+                print(f"  Skipping {project_id}: {age_note}")
+                if debug_extraction and latest:
+                    print(f"     latest scraped_at={latest.get('scraped_at')}")
+                # Existing-row enrichment: fill missing details without new occurrence/email
+                if latest and not dry_run and _row_needs_detail_enrichment(latest):
+                    try:
+                        print(f"     Enriching incomplete existing row {latest.get('id')}...")
+                        counts["details_attempted"] += 1
+                        cardish = dict(project)
+                        cardish["source_url"] = (
+                            project.get("source_url")
+                            or project.get("url")
+                            or latest.get("source_url")
+                        )
+                        merged, _details = enrich_project_with_details(driver, cardish)
+                        payload = _detail_update_payload(latest, merged)
+                        db.update_project_details(latest["id"], payload)
+                        status = (payload.get("detail_extraction_status") or "").upper()
+                        if status in ("FAILED", "TIMEOUT"):
+                            counts["details_failed"] += 1
+                        else:
+                            counts["details_completed"] += 1
+                        print(
+                            f"     ✅ enriched detail_status={status} "
+                            f"desc_len={len(payload.get('description') or '')}"
+                        )
+                    except Exception as enrich_err:
+                        counts["details_failed"] += 1
+                        partial = True
+                        print(
+                            f"     ⚠️ Existing-row enrichment failed: "
+                            f"{redact_sensitive_text(enrich_err)}"
+                        )
+                continue
+
+            print(f"  → {project.get('title', '')[:60]}... ({reason})")
+            print("     Fetching full project details...")
+            counts["details_attempted"] += 1
+            try:
+                result = process_eligible_project(
+                    driver,
+                    project,
+                    run.get("id") if run else None,
+                    dry_run=dry_run,
+                    debug_extraction=debug_extraction,
+                )
+                if result.get("inserted"):
+                    counts["projects_inserted"] += 1
+                    new_count += 1
+                    counts["details_completed"] += 1
+                    if result.get("emailed"):
+                        counts["emails_sent"] += 1
+                    else:
+                        counts["emails_failed"] += 1
+                        partial = True
+                elif result.get("dry_run"):
+                    new_count += 1
+                    counts["details_completed"] += 1
+            except Exception as proc_err:
+                partial = True
+                counts["details_failed"] += 1
+                print(f"  ⚠️ Project processing failed: {redact_sensitive_text(proc_err)}")
+                notify_db_error(
+                    "DATABASE:PROJECT_INSERT_FAILED",
+                    proc_err,
+                    project_id=project_id,
+                    operation="process_eligible_project",
+                )
+
+        if new_count:
+            print(f"🎯 Processed {new_count} NEW project(s)!")
+        else:
+            print("⏳ No new projects")
+
+        print(
+            f"📊 Stats: {len(all_projects)} visible, "
+            f"inserted={counts['projects_inserted']} skipped={counts['projects_skipped']}"
+        )
+
+        if run and run.get("id") and not dry_run:
+            status = "PARTIAL" if partial or counts["emails_failed"] or counts["details_failed"] else "COMPLETED"
+            db.complete_scraper_run(run["id"], status=status, **counts)
+        return cold_start_pending
+    except Exception as cycle_err:
+        if run and run.get("id") and not dry_run:
+            try:
+                db.fail_scraper_run(
+                    run["id"],
+                    "MONITORING_CYCLE_FAILED",
+                    redact_sensitive_text(cycle_err),
+                    **counts,
+                )
+            except Exception:
+                pass
+        raise
+
+
+def main(run_once=False, dry_run=False, debug_extraction=False):
     """Main monitoring loop"""
     global _monitor_check_count, _monitor_state, last_scan_issue
 
@@ -1852,7 +2461,6 @@ def main():
         session = setup_session(driver)
         if not session.get("success"):
             print("❌ Failed to establish session")
-            # Avoid duplicate alert when login already notified
             if not session.get("alert_sent") and not _last_login_alert.get("alert_sent"):
                 send_error_notification(
                     "SESSION_SETUP:FAILED",
@@ -1860,13 +2468,10 @@ def main():
                     details=f"classification={session.get('classification')}",
                     diagnostics={**_safe_driver_info(driver), "operation": "session_setup"},
                 )
-            # Auth failure retry with LOGIN_RETRY_INTERVAL (cooldown suppresses repeat emails)
             if session.get("classification"):
                 print(f"⏳ Login retry in {Config.LOGIN_RETRY_INTERVAL}s...")
-                try:
-                    driver.quit()
-                except Exception:
-                    pass
+                safe_quit_driver(driver)
+                driver = None
                 time.sleep(Config.LOGIN_RETRY_INTERVAL)
                 try:
                     driver = initialize_driver()
@@ -1880,6 +2485,17 @@ def main():
                     )
                     return
                 if not session.get("success"):
+                    try:
+                        if not dry_run:
+                            run = db.create_scraper_run(platform=PLATFORM)
+                            db.fail_scraper_run(
+                                run["id"],
+                                session.get("classification") or "AUTH_FAILED",
+                                session.get("message") or "Auth failed",
+                                status="AUTH_FAILED",
+                            )
+                    except Exception:
+                        pass
                     return
             else:
                 return
@@ -1888,21 +2504,17 @@ def main():
         try:
             cold_start_pending = db_is_cold_start()
             init_db()
-            seen_ids, known_ids, latest_by_id = get_project_history()
         except Exception as db_err:
             send_error_notification(
                 "DATABASE:INITIALIZATION_FAILED",
                 db_err,
                 traceback_text=traceback.format_exc(),
-                diagnostics={"database": "office_monitor", "collection": "projects"},
+                diagnostics={"database": "supabase", "platform": PLATFORM},
                 force=True,
             )
             raise
 
-        print(
-            f"📁 DB loaded — {len(seen_ids)} occurrence(s) across "
-            f"{len(known_ids)} project ID(s)\n"
-        )
+        print(f"📁 Supabase ready — platform={PLATFORM}\n")
         if cold_start_pending:
             print(
                 "⚙️  First run detected — the first successful scan will be "
@@ -1920,70 +2532,28 @@ def main():
                 print(f"🔄 Check #{check_count} - {datetime.now(PKT).strftime('%H:%M:%S')} PKT")
                 print(f"{'='*30}")
 
-                _navigate_to_search(driver)
-
-                all_projects = scan_for_projects(driver)
-
-                if not all_projects:
-                    print("⚠️ No projects found")
-                    # Scan already alerted if classified failure; do not double-alert
-                    time.sleep(Config.CHECK_INTERVAL)
-                    continue
-
-                # Never alert on the first run. Keep seeding until Mongo confirms.
-                if cold_start_pending:
-                    print("⚙️  Seeding first successful scan (project emails suppressed)...")
-                    if bulk_insert_projects(all_projects, emailed=False):
-                        seen_ids, known_ids, latest_by_id = get_project_history()
-                        cold_start_pending = False
-                        print(
-                            f"✅ Seeded {len(all_projects)} existing project(s). "
-                            "Only qualifying future posts will trigger emails.\n"
-                        )
-                    else:
-                        print(
-                            "⚠️  Initial seed was not confirmed; project emails remain "
-                            "suppressed and seeding will retry next cycle.\n"
-                        )
-                    time.sleep(Config.CHECK_INTERVAL)
-                    continue
-
-                new_projects = filter_new_projects(
-                    all_projects, seen_ids, known_ids, latest_by_id
+                cold_start_pending = run_monitoring_cycle(
+                    driver,
+                    cold_start_pending=cold_start_pending,
+                    dry_run=dry_run,
+                    debug_extraction=debug_extraction,
+                    run_once=run_once,
                 )
 
-                if new_projects:
-                    print(f"🎯 Found {len(new_projects)} NEW project(s)!")
-                    for project in new_projects:
-                        print(f"  → {project['title'][:60]}...")
-                        print(f"     Fetching full project details...")
-                        details = fetch_project_details(driver, project['url'])
-                        project.update(details)
-                        emailed = send_notification(project)
-                        insert_project(project, emailed=emailed)
-                        key = make_dedupe_key(project["id"], project.get("time_posted", ""))
-                        seen_ids.add(key)
-                        known_ids.add(project["id"])
-                        posted_date = _parse_posted_date(project.get("time_posted"))
-                        current_latest = latest_by_id.get(project["id"])
-                        if posted_date and (
-                            current_latest is None or posted_date > current_latest
-                        ):
-                            latest_by_id[project["id"]] = posted_date
-                else:
-                    print("⏳ No new projects")
+                if run_once or dry_run:
+                    print("✅ Run-once / dry-run complete")
+                    break
 
-                print(
-                    f"📊 Stats: {len(all_projects)} visible, "
-                    f"{len(seen_ids)} occurrence(s) / {len(known_ids)} ID(s) in DB"
-                )
                 print(f"\n⏳ Next check in {Config.CHECK_INTERVAL} seconds...")
                 time.sleep(Config.CHECK_INTERVAL)
 
             except KeyboardInterrupt:
                 raise
             except Exception as loop_err:
-                print(f"⚠️ Check failed: {redact_sensitive_text(loop_err)} — retrying in {Config.CHECK_INTERVAL}s...")
+                print(
+                    f"⚠️ Check failed: {redact_sensitive_text(loop_err)} — "
+                    f"retrying in {Config.CHECK_INTERVAL}s..."
+                )
                 send_error_notification(
                     "MONITORING_CYCLE:FAILED",
                     loop_err,
@@ -1995,10 +2565,10 @@ def main():
                     traceback_text=traceback.format_exc(),
                     diagnostics={**_safe_driver_info(driver), "operation": "monitoring_cycle"},
                 )
-                try:
-                    driver.quit()
-                except Exception:
-                    pass
+                if run_once or dry_run:
+                    break
+                safe_quit_driver(driver)
+                driver = None
                 time.sleep(Config.CHECK_INTERVAL)
                 try:
                     driver = initialize_driver()
@@ -2026,7 +2596,6 @@ def main():
     except Exception as e:
         print(f"\n❌ Error: {redact_sensitive_text(e)}")
         _monitor_state = "fatal"
-        # Do not duplicate classified login alerts
         if not _last_login_alert.get("alert_sent"):
             send_error_notification(
                 "MONITORING_LOOP:FATAL_ERROR",
@@ -2036,14 +2605,336 @@ def main():
                 force=True,
             )
     finally:
-        if driver is not None:
-            try:
-                driver.quit()
-            except Exception:
-                pass
+        safe_quit_driver(driver)
         print("✅ Monitor stopped")
 
+
+def run_test_supabase():
+    """Validate Supabase credentials and schema with a reversible test."""
+    print_startup_banner()
+    try:
+        summary = db.test_supabase_connection(cleanup=True)
+    except Exception as e:
+        print(f"❌ Supabase test failed: {redact_sensitive_text(e)}")
+        return 1
+    print("Supabase tables:")
+    for name, ok in (summary.get("tables") or {}).items():
+        print(f"  - {name}: {'OK' if ok else 'MISSING'}")
+    print("✅ Supabase connectivity test passed (temporary rows cleaned up)")
+    return 0
+
+
+def _detail_update_payload(existing_row, merged):
+    """Build enrichment payload for update_project_details."""
+    allowed = db.DETAIL_UPDATE_ALLOWED
+    payload = {}
+    for key in allowed:
+        if key not in merged:
+            continue
+        val = merged.get(key)
+        # Preserve existing useful values when merge left empty
+        if extraction.is_empty_value(val) and not extraction.is_empty_value(existing_row.get(key)):
+            continue
+        payload[key] = val
+    # Always sync status/diagnostics from merged
+    for key in (
+        "detail_extraction_status",
+        "detail_attempt_count",
+        "detail_last_attempt_at",
+        "detail_completed_at",
+        "detail_failure_code",
+        "detail_last_error",
+        "missing_fields",
+        "extraction_warnings",
+        "extraction_metadata",
+        "card_extraction_status",
+    ):
+        if key in merged:
+            payload[key] = merged.get(key)
+    return payload
+
+
+def _row_needs_detail_enrichment(row: dict) -> bool:
+    """True when an existing Catalant row still lacks core detail fields."""
+    if not row:
+        return False
+    status = (row.get("detail_extraction_status") or "").upper()
+    if status in ("NOT_ATTEMPTED", "PARTIAL", "FAILED", "TIMEOUT"):
+        return True
+    for field in (
+        "description",
+        "location_preference",
+        "project_length",
+        "start_date_text",
+        "level_of_support",
+        "industry",
+        "contracting_process",
+    ):
+        val = row.get(field)
+        if val is None or (isinstance(val, str) and not val.strip()):
+            return True
+    return False
+
+
+def run_backfill_missing_details(
+    *,
+    dry_run=False,
+    limit=20,
+    project_id=None,
+    retry_failed=False,
+):
+    """Enrich existing Catalant rows without new occurrences or emails."""
+    print_startup_banner()
+    init_db()
+    rows = db.get_projects_needing_detail_enrichment(
+        platform=PLATFORM,
+        limit=limit,
+        project_id=project_id,
+        retry_failed=retry_failed,
+    )
+    print(f"Backfill candidates: {len(rows)} (limit={limit})")
+    if not rows:
+        return 0
+
+    driver = None
+    updated = failed = 0
+    try:
+        driver = initialize_driver()
+        session = setup_session(driver)
+        if not session.get("success"):
+            print("❌ Cannot backfill — auth/session failed")
+            return 2
+        for row in rows:
+            pid = row.get("project_id")
+            url = row.get("source_url")
+            print(f"\n→ Backfill {pid} ({row.get('id')})")
+            cardish = {
+                "id": pid,
+                "project_id": pid,
+                "platform": PLATFORM,
+                "title": row.get("title"),
+                "short_description": row.get("short_description"),
+                "description": row.get("description"),
+                "location": row.get("location"),
+                "location_preference": row.get("location_preference"),
+                "budget_text": row.get("budget_text"),
+                "duration_text": row.get("duration_text"),
+                "project_length": row.get("project_length"),
+                "platform_category": row.get("platform_category"),
+                "platform_category_path": row.get("platform_category_path") or [],
+                "platform_category_raw": row.get("platform_category_raw"),
+                "platform_category_source": row.get("platform_category_source"),
+                "platform_category_confidence": row.get("platform_category_confidence"),
+                "platform_category_extraction_status": row.get("platform_category_extraction_status"),
+                "time_posted_text": row.get("time_posted_text"),
+                "source_url": url,
+                "url": url,
+                "status": row.get("status"),
+                "raw_data": row.get("raw_data") or {},
+                "extraction_warnings": row.get("extraction_warnings") or [],
+                "extraction_metadata": row.get("extraction_metadata") or {},
+            }
+            try:
+                merged, details = enrich_project_with_details(driver, cardish)
+                payload = _detail_update_payload(row, merged)
+                # Preserve suppressed email fields by never including them
+                if dry_run:
+                    preview = {
+                        k: payload.get(k)
+                        for k in (
+                            "description",
+                            "location_preference",
+                            "budget_text",
+                            "project_length",
+                            "start_date_text",
+                            "level_of_support",
+                            "industry",
+                            "contracting_process",
+                            "detail_extraction_status",
+                            "missing_fields",
+                        )
+                        if k in payload
+                    }
+                    print(f"  [dry-run] would update {row['id']}: {preview}")
+                    updated += 1
+                    continue
+                db.update_project_details(row["id"], payload)
+                print(
+                    f"  ✅ updated detail_status={payload.get('detail_extraction_status')} "
+                    f"desc_len={len(payload.get('description') or '')}"
+                )
+                updated += 1
+            except Exception as e:
+                failed += 1
+                print(f"  ❌ backfill failed: {redact_sensitive_text(e)}")
+                notify_db_error(
+                    "DATABASE:DETAIL_BACKFILL_FAILED",
+                    e,
+                    project_id=pid,
+                    operation="backfill_missing_details",
+                )
+    finally:
+        safe_quit_driver(driver)
+    print(f"\nBackfill complete: updated={updated} failed={failed} dry_run={dry_run}")
+    return 0 if failed == 0 else 1
+
+
+def run_inspect_project(target=None, *, debug=True):
+    """Inspect one project detail page and print field-level report."""
+    print_startup_banner()
+    driver = None
+    try:
+        driver = initialize_driver()
+        session = setup_session(driver)
+        if not session.get("success"):
+            print("❌ Auth/session failed")
+            return 2
+
+        title = ""
+        url = None
+        project_id = None
+        if target and str(target).startswith("http"):
+            url = target
+            m = re.search(r"/need/([^/]+)/?", url)
+            project_id = m.group(1) if m else None
+        elif target:
+            project_id = str(target).strip()
+            url = f"https://app.gocatalant.com/c/_/u/0/need/{project_id}/"
+        else:
+            # Fall back to first listing card
+            _navigate_to_search(driver)
+            cards = scan_for_projects(driver)
+            if not cards:
+                print("No projects found to inspect")
+                return 1
+            project_id = cards[0].get("project_id")
+            url = cards[0].get("source_url")
+            title = cards[0].get("title") or ""
+            print(f"Inspecting first listing card: {project_id}")
+
+        print(f"Project ID: {project_id}")
+        print(f"URL: {url}")
+        details = fetch_project_details(driver, url, title=title)
+        print(f"Detail page loaded: {details.get('detail_extraction_status') not in ('TIMEOUT', 'FAILED', 'NOT_ATTEMPTED')}")
+        print(f"detail_extraction_status: {details.get('detail_extraction_status')}")
+        for field in (
+            "description",
+            "location_preference",
+            "budget_text",
+            "project_length",
+            "start_date_text",
+            "level_of_support",
+            "industry",
+            "contracting_process",
+            "skills",
+        ):
+            val = details.get(field)
+            meta = (details.get("extraction_metadata") or {})
+            extracted = field in (meta.get("fields_extracted") or [])
+            visible = field in (meta.get("fields_visible_on_page") or [])
+            status = "FOUND" if extracted or not extraction.is_empty_value(val) else (
+                "MISSING" if visible else "NOT_EXPOSED"
+            )
+            print(f"\n{field}:")
+            print(f"  status: {status}")
+            if field == "description" and val:
+                print(f"  characters: {len(val)}")
+            elif val:
+                print(f"  value: {str(val)[:120]}")
+            if visible and extraction.is_empty_value(val):
+                print("  visible label found: yes")
+
+        # Safe evidence
+        try:
+            ts = datetime.now(PKT).strftime("%Y%m%d_%H%M%S")
+            base = os.path.join(_evidence_dir(), f"catalant_inspect_{project_id or 'unknown'}_{ts}")
+            driver.save_screenshot(f"{base}.png")
+            safe_json = {
+                "project_id": project_id,
+                "url": url,
+                "detail_extraction_status": details.get("detail_extraction_status"),
+                "fields": {
+                    k: details.get(k)
+                    for k in (
+                        "description",
+                        "location_preference",
+                        "budget_text",
+                        "project_length",
+                        "start_date_text",
+                        "level_of_support",
+                        "industry",
+                        "contracting_process",
+                        "platform_category",
+                    )
+                },
+                "missing_fields": details.get("missing_fields"),
+                "extraction_warnings": details.get("extraction_warnings"),
+                "extraction_metadata": details.get("extraction_metadata"),
+            }
+            with open(f"{base}.json", "w", encoding="utf-8") as fh:
+                json.dump(safe_json, fh, indent=2, default=str)
+            print(f"\nEvidence saved: {base}.png / {base}.json")
+        except Exception as e:
+            print(f"Evidence save skipped: {redact_sensitive_text(e)}")
+        return 0
+    finally:
+        safe_quit_driver(driver)
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="Catalant Project Monitor")
+    parser.add_argument("--test-error-email", action="store_true")
+    parser.add_argument("--test-supabase", action="store_true")
+    parser.add_argument(
+        "--inspect-project",
+        nargs="?",
+        const="",
+        default=None,
+        help="Inspect a project URL or project id (implies authenticated session)",
+    )
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--run-once", action="store_true")
+    parser.add_argument("--debug-extraction", action="store_true")
+    parser.add_argument("--retry-pending-emails", action="store_true")
+    parser.add_argument("--backfill-missing-details", action="store_true")
+    parser.add_argument("--limit", type=int, default=20)
+    parser.add_argument("--project-id", default=None)
+    parser.add_argument("--retry-failed", action="store_true")
+    return parser.parse_args(argv)
+
+
+def cli_main(argv=None):
+    args = parse_args(argv)
+    if args.test_error_email:
+        return run_test_error_email()
+    if args.test_supabase:
+        return run_test_supabase()
+    if args.backfill_missing_details:
+        return run_backfill_missing_details(
+            dry_run=args.dry_run,
+            limit=args.limit,
+            project_id=args.project_id,
+            retry_failed=args.retry_failed,
+        )
+    if args.inspect_project is not None:
+        target = args.inspect_project or args.project_id
+        return run_inspect_project(target)
+    if args.retry_pending_emails:
+        print_startup_banner()
+        try:
+            init_db()
+            stats = retry_pending_emails(dry_run=args.dry_run)
+            print(f"Retry complete: {stats}")
+            return 0
+        except Exception as e:
+            print(f"❌ Retry failed: {redact_sensitive_text(e)}")
+            return 1
+    dry_run = args.dry_run
+    run_once = args.run_once or dry_run
+    debug_extraction = args.debug_extraction
+    main(run_once=run_once, dry_run=dry_run, debug_extraction=debug_extraction)
+    return 0
+
+
 if __name__ == "__main__":
-    if TEST_ERROR_EMAIL_MODE:
-        raise SystemExit(run_test_error_email())
-    main()
+    raise SystemExit(cli_main())
