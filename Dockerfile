@@ -1,8 +1,10 @@
 FROM python:3.11-slim-bookworm
+
+# Install Chromium + matching chromedriver from current Debian repos.
+# Do not pin exact package versions — Debian drops old builds and Railway rebuilds fail.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    chromium=147.0.7727.137-1~deb12u1 \
-    chromium-common=147.0.7727.137-1~deb12u1 \
-    chromium-driver=147.0.7727.137-1~deb12u1 \
+    chromium \
+    chromium-driver \
     fonts-liberation \
     libasound2 \
     libatk-bridge2.0-0 \
@@ -24,9 +26,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     xdg-utils \
     && apt-mark hold chromium chromium-common chromium-driver \
     && rm -rf /var/lib/apt/lists/*
+
 ENV CHROME_BIN=/usr/bin/chromium
 ENV CHROMEDRIVER_PATH=/usr/bin/chromedriver
 ENV HEADLESS=True
+
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
