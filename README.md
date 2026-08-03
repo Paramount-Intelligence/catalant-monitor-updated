@@ -1,6 +1,8 @@
 # Catalant Project Monitor
 
-Clean, minimal, and robust Selenium scraper for monitoring Catalant projects with email notifications.
+Selenium scraper for Catalant projects with email notifications and **shared Supabase storage**.
+
+All marketplace scrapers (Catalant and future sites) use the **same Supabase database and the same `projects` columns**. See [`docs/SCHEMA_AND_SCRAPER.md`](docs/SCHEMA_AND_SCRAPER.md) — especially **Building a scraper for another website** — before starting a second platform scraper.
 
 ## Features
 

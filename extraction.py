@@ -313,6 +313,35 @@ def _is_non_duration_timeline(value: str) -> bool:
     return s in ("asap", "immediately", "immediate", "tbd", "flexible", "as soon as possible")
 
 
+def _derive_remote_or_onsite(location_value: str) -> Optional[str]:
+    """
+    Map Catalant Location / Location Preference values onto remote_or_onsite
+    when the site does not expose a separate work-arrangement label.
+    """
+    text = normalize_visible_text(location_value)
+    if not text:
+        return None
+    lower = text.lower()
+    if re.search(r"\bhybrid\b", lower):
+        return "Hybrid"
+    if re.search(r"\bremote[- ]friendly\b|\bremote\b", lower) and not re.search(
+        r"\bon[- ]?site\b|\bin[- ]?person\b", lower
+    ):
+        # Prefer the site's own wording when short; otherwise normalize
+        if lower.strip() in ("remote", "fully remote", "remote only"):
+            return "Remote"
+        if "remote" in lower and len(text.split()) <= 8:
+            return text
+        return "Remote"
+    if re.search(r"\bon[- ]?site\b|\bin[- ]?person\b", lower) and "remote" not in lower:
+        if lower.strip() in ("on-site", "onsite", "on site", "in-person", "in person"):
+            return "On-site"
+        if len(text.split()) <= 8:
+            return text
+        return "On-site"
+    return None
+
+
 def parse_budget(candidate: str) -> dict:
     text = normalize_visible_text(candidate)
     out = {
@@ -633,6 +662,17 @@ def extract_detail_fields_from_body(body_text: str, *, title: str = "", project:
             details.setdefault("location", loc["value"])
             metadata["fields_extracted"].append("location_preference")
             metadata["fields_visible_on_page"].append("location_preference")
+            # Catalant often exposes work mode only as Location Preference = Remote|On-site|Hybrid
+            if is_empty_value(details.get("remote_or_onsite")):
+                derived = _derive_remote_or_onsite(loc["value"])
+                if derived:
+                    details["remote_or_onsite"] = derived
+                    metadata["fields_extracted"].append("remote_or_onsite")
+                    metadata["fields_visible_on_page"].append("remote_or_onsite")
+                    # Was marked not_exposed earlier from label_map — correct that
+                    metadata["fields_not_exposed"] = [
+                        f for f in metadata["fields_not_exposed"] if f != "remote_or_onsite"
+                    ]
         else:
             warnings.append("LOCATION_AMBIGUOUS")
             metadata["fields_visible_on_page"].append("location_preference")

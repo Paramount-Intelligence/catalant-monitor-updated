@@ -1,24 +1,179 @@
-# Catalant Monitor — Schema & How It Works
+# Project Monitor — Shared Schema & Scraper Guide
 
-This document describes the Supabase PostgreSQL schema and the production Selenium scraper’s runtime behavior.
+This document describes the **shared Supabase PostgreSQL schema** used by every marketplace scraper, plus how the Catalant Selenium scraper behaves today.
 
 ## Overview
 
-The monitor logs into Catalant, scans Search Projects, decides which listings are eligible under a **3-day repeat rule**, fetches detail pages, inserts a new `projects` row, then sends email. Storage is **Supabase only** (no MongoDB at runtime).
+All scrapers (Catalant now; BTG, Guru, Hubstaff, Toptal, etc. later) write into the **same Supabase project** and the **same four tables**. They must map site-specific HTML into the **same `projects` columns**. Do not create a separate database or parallel project table per website.
 
 | Piece | Role |
 | --- | --- |
-| `monitor.py` | CLI entrypoint |
-| `script_clean.py` | Login, Selenium scan, detail fetch, email, main loop |
-| `extraction.py` | Category helpers + safe card/detail merge |
-| `database.py` | Supabase client + repository functions |
-| `supabase/migrations/` | Schema source of truth |
+| `monitor.py` | CLI entrypoint (Catalant) |
+| `script_clean.py` | Catalant login, Selenium scan, detail fetch, email, main loop |
+| `extraction.py` | Shared helpers (merge, budget, posted time, status) + Catalant extractors |
+| `database.py` | Shared Supabase client + repository functions for all platforms |
+| `supabase/migrations/` | Schema source of truth for every scraper |
 
-Platform value written by this scraper: **`catalant`**. The same `projects` table is shared with future scrapers (`btg`, `guru`, `hubstaff`, `toptal`, etc.).
+Catalant platform value: **`catalant`**. Other scrapers use their own lowercase `platform` string in the same rows.
 
 ---
 
-## How the scraper works
+## Building a scraper for another website
+
+Use this checklist so every new marketplace attaches to the **same DB** and fills the **same columns**.
+
+### 1. Same Supabase attachment
+
+- Reuse the existing Supabase project URL + **secret** key (`SUPABASE_*` in `.env`).
+- Reuse tables: `projects`, `scraper_runs`, `email_attempts`, `scraper_sessions`.
+- Reuse `database.py` (or import it). Do **not** invent a second schema.
+- Apply migrations from `supabase/migrations/` once per Supabase project (including enrichment columns).
+- Set a unique lowercase `platform` value, e.g. `btg`, `guru`, `hubstaff`, `toptal`.
+- Store cookies under that same `platform` in `scraper_sessions`.
+
+### 2. Same occurrence / email rules
+
+Every platform scraper should keep these behaviors identical:
+
+| Rule | Behavior |
+| --- | --- |
+| Occurrence rows | Insert a **new** `projects` row when eligible (no unique constraint on `platform + project_id`) |
+| 3-day rule | Skip insert + email when latest row for `(platform, project_id)` has `scraped_at` age ≤ 3 days |
+| Cold start | First successful scan seeds existing listings as `SUPPRESSED` / `COLD_START_SEED` (no project emails) |
+| Detail before insert | Fetch detail page (when the site has one) before inserting a seed or eligible occurrence |
+| Enrichment | Update the **same** `projects.id` for missing detail fields; never create a row only to fill columns |
+| Email | Insert → `PENDING` → `email_attempts` → send → update **same** project + attempt rows |
+| Sessions | Save/load cookies via `scraper_sessions` for that platform |
+
+### 3. Required identity fields (every platform)
+
+Always populate:
+
+| Column | Requirement |
+| --- | --- |
+| `platform` | Your marketplace key |
+| `project_id` | Stable source id (string) |
+| `source_url` | Canonical project URL |
+| `title` | Non-empty title |
+
+Without these three identity fields (`project_id`, `title`, `source_url`), do not insert.
+
+### 4. Shared columns every scraper should target
+
+Map each site into these columns when the data is genuinely visible. Leave null / empty when the site does not expose the field — do not invent values.
+
+#### Listing card (minimum useful set)
+
+| Column | Purpose |
+| --- | --- |
+| `title` | Card title |
+| `short_description` | Card summary / blurb only (not full page body) |
+| `source_url` / `project_id` | Link + id |
+| `platform_category*` | Category / pool / breadcrumb fields |
+| `location` | Card location if shown |
+| `budget_text` (+ parsed `budget_min` / `budget_max` / `budget_currency` when possible) | Rate or budget display |
+| `duration_text` | Card duration if shown |
+| `time_posted_text` | Relative/absolute “posted” text |
+| `source_posted_at` / `source_posted_at_is_estimated` | Normalized posted time when parseable |
+| `status` | Posted / open / etc. |
+| `card_extraction_status` | `COMPLETE` / `PARTIAL` / `FAILED` |
+| `missing_fields` / `extraction_warnings` / `extraction_metadata` | Diagnostics |
+
+#### Detail page (fill whenever exposed)
+
+| Column | Purpose |
+| --- | --- |
+| `description` | Full project description (not title/nav/footer) |
+| `location_preference` | Structured location preference |
+| `remote_or_onsite` | Remote / hybrid / onsite |
+| `country_or_region` | Country or region |
+| `project_length` / `duration_text` | Engagement length / timeline |
+| `start_date_text` / `source_start_date` | Start date text + parsed `date` when calendar-parseable |
+| `budget_text` + billing helpers | Structured budget / rate (`billing_type`, `hourly_rate`, `daily_rate`, `budget_source`, `budget_confidence` when migration applied) |
+| `level_of_support` | Expert type / support level |
+| `industry` | Industry background |
+| `contracting_process` | Contracting process |
+| `skills` / `expertise` / `deliverables` | Tag arrays |
+| `engagement_type` / `project_type` / `workstream` | Engagement metadata |
+| `estimated_hours` / `weekly_commitment` | Effort / weekly load |
+| `application_deadline` | Deadline when shown |
+| `detail_extraction_status` | `NOT_ATTEMPTED` / `COMPLETE` / `PARTIAL` / `FAILED` / `TIMEOUT` |
+| Detail attempt columns | `detail_attempt_count`, `detail_last_attempt_at`, `detail_completed_at`, `detail_failure_code`, `detail_last_error` |
+
+#### Always set by the shared repository / lifecycle
+
+| Column | Purpose |
+| --- | --- |
+| `scraped_at` / `first_detected_at` / `last_seen_at` | Occurrence timing (3-day rule uses `scraped_at`) |
+| `email_*` | Email lifecycle fields |
+| `scraper_run_id` | Link to `scraper_runs` |
+
+### 5. What to customize vs reuse
+
+| Reuse as-is | Customize per website |
+| --- | --- |
+| `database.py` | Login / cookie domain |
+| Migrations + table names | Listing selectors and card parsers |
+| 3-day eligibility helpers | Detail-page wait + field selectors |
+| Email attempt lifecycle APIs | HTML email formatting for site-specific labels |
+| `merge_project_data` / budget / posted-time helpers | `PLATFORM = "your_platform"` |
+| Cold-start suppression semantics | CLI entrypoint / Railway service for that scraper |
+
+### 6. Suggested new-scraper layout
+
+```text
+your-site-monitor/
+  monitor.py              # CLI → main loop
+  script_clean.py         # or site-specific module
+  extraction.py           # site selectors + shared helpers import
+  database.py             # copy or shared package — same Supabase schema
+  .env                    # SUPABASE_* shared; site login + SMTP own
+  supabase/migrations/    # same migrations (already applied on shared DB)
+```
+
+Example env for a second scraper (same DB, different platform credentials):
+
+```env
+SUPABASE_URL=https://<same-project>.supabase.co
+SUPABASE_SECRET_KEY=<same-secret-key>
+# site-specific
+BTG_EMAIL=...
+BTG_PASSWORD=...
+COOKIES_FILE=btg_cookies.json
+```
+
+In code, always write:
+
+```python
+platform = "btg"   # never reuse "catalant" for another site
+```
+
+### 7. Verification query (any platform)
+
+```sql
+select
+  platform,
+  project_id,
+  title,
+  length(description) as description_length,
+  location_preference,
+  budget_text,
+  project_length,
+  start_date_text,
+  industry,
+  contracting_process,
+  detail_extraction_status,
+  email_status,
+  scraped_at
+from public.projects
+where platform = 'your_platform'
+order by scraped_at desc
+limit 50;
+```
+
+---
+
+## How the Catalant scraper works
 
 ### 1. Startup
 
@@ -61,7 +216,7 @@ There is **no** unique constraint on `(platform, project_id)`. The same marketpl
 Eligibility query:
 
 ```text
-platform = catalant
+platform = <your_platform>   -- e.g. catalant
 project_id = <source id>
 order by scraped_at desc
 limit 1
@@ -107,6 +262,7 @@ python monitor.py --test-supabase
 python monitor.py --test-error-email
 python monitor.py --inspect-project
 python monitor.py --dry-run --run-once --debug-extraction
+python monitor.py --backfill-missing-details --dry-run --limit 5
 python monitor.py --retry-pending-emails --dry-run
 ```
 
@@ -116,7 +272,7 @@ Dry-run uses the real Catalant page when authenticated, prints extraction/eligib
 
 ## Table: `projects` (shared main table)
 
-One row = one **occurrence** of a marketplace project for a platform.
+One row = one **occurrence** of a marketplace project for a platform. **All scrapers share this table.**
 
 ### Identity
 
@@ -124,7 +280,7 @@ One row = one **occurrence** of a marketplace project for a platform.
 | --- | --- | --- |
 | `id` | uuid | Internal Supabase primary key for this occurrence row |
 | `platform` | text | Lowercase marketplace id (`catalant`, `btg`, `guru`, …). Not constrained to a fixed list |
-| `project_id` | text | Source/marketplace project id (Catalant need id) |
+| `project_id` | text | Source/marketplace project id |
 | `source_url` | text | Canonical project URL on the marketplace |
 
 ### Content
@@ -156,7 +312,12 @@ One row = one **occurrence** of a marketplace project for a platform.
 | `budget_text` | text | Budget as displayed text |
 | `budget_min` / `budget_max` | numeric | Parsed numeric bounds when available |
 | `budget_currency` | text | Currency code/symbol when available |
-| `duration_text` | text | Duration string from the card |
+| `billing_type` | text | `hourly` / `daily` / `fixed` / `fixed_range` when parsed |
+| `hourly_rate` / `daily_rate` | numeric | Parsed rates when available |
+| `rate_currency` | text | Currency for rate fields |
+| `budget_source` | text | e.g. structured label, `title_rate_fallback` |
+| `budget_confidence` | text | `HIGH` / `MEDIUM` / `LOW` |
+| `duration_text` | text | Duration string |
 | `project_length` | text | Timeline / expected length from detail |
 | `start_date_text` | text | Start date as shown on the site |
 | `source_start_date` | date | Parsed calendar start date when determinable |
@@ -197,6 +358,11 @@ One row = one **occurrence** of a marketplace project for a platform.
 | --- | --- | --- |
 | `card_extraction_status` | text | `COMPLETE` / `PARTIAL` / `FAILED` |
 | `detail_extraction_status` | text | `NOT_ATTEMPTED` / `COMPLETE` / `PARTIAL` / `FAILED` / `TIMEOUT` |
+| `detail_attempt_count` | integer | Detail fetch attempts for this row |
+| `detail_last_attempt_at` | timestamptz | Last detail attempt |
+| `detail_completed_at` | timestamptz | Last successful/finished detail extraction |
+| `detail_failure_code` | text | Classified detail failure |
+| `detail_last_error` | text | Sanitized detail error |
 | `missing_fields` | text[] | Important fields still empty after merge |
 | `extraction_warnings` | text[] | Non-fatal extraction/merge warnings |
 | `extraction_metadata` | jsonb | Extra extractor diagnostics |
@@ -230,13 +396,13 @@ One row = one **occurrence** of a marketplace project for a platform.
 
 ## Table: `scraper_runs`
 
-One row per monitoring cycle.
+One row per monitoring cycle (any platform).
 
 | Column | Type | Meaning |
 | --- | --- | --- |
 | `id` | uuid | Run id |
 | `platform` | text | Platform being scraped |
-| `scraper_name` | text | Scraper identifier (`catalant-monitor`) |
+| `scraper_name` | text | Scraper identifier (`catalant-monitor`, `btg-monitor`, …) |
 | `scraper_version` | text | Version string |
 | `started_at` / `completed_at` | timestamptz | Run window |
 | `status` | text | `RUNNING`, `COMPLETED`, `PARTIAL`, `FAILED`, `AUTH_FAILED`, `CANCELLED` |
@@ -257,7 +423,7 @@ One row per monitoring cycle.
 
 ## Table: `email_attempts`
 
-Auditable history of each send attempt against a **project occurrence** (`projects.id`).
+Auditable history of each send attempt against a **project occurrence** (`projects.id`). Shared across platforms.
 
 | Column | Type | Meaning |
 | --- | --- | --- |
@@ -281,7 +447,7 @@ One session row per platform (primary key = `platform`). Used for cookie restore
 
 | Column | Type | Meaning |
 | --- | --- | --- |
-| `platform` | text | Platform key (`catalant`) |
+| `platform` | text | Platform key (`catalant`, `btg`, …) |
 | `session_data` | jsonb | Sanitized Selenium cookies JSON (`{"cookies":[...]}`) |
 | `saved_at` | timestamptz | When session was saved |
 | `expires_at` | timestamptz | Earliest cookie expiry when determinable |
@@ -289,7 +455,7 @@ One session row per platform (primary key = `platform`). Used for cookie restore
 | `metadata` | jsonb | Safe metadata (e.g. cookie count) — never passwords |
 | `created_at` / `updated_at` | timestamptz | Audit timestamps |
 
-Passwords (Catalant / SMTP) are never stored here. Raw cookies are never logged or attached to operational emails.
+Passwords are never stored here. Raw cookies are never logged or attached to operational emails.
 
 ---
 

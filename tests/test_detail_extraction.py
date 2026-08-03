@@ -82,7 +82,19 @@ class DetailBodyExtractionTests(unittest.TestCase):
         self.assertEqual(details.get("start_date_text"), "Aug 31, 2026")
         self.assertEqual(details.get("budget_text"), "Not provided")
         self.assertEqual(details.get("location_preference"), "Remote")
+        # Dedicated "In-person vs. Remote" label wins when present
         self.assertIn("Remote-friendly", details.get("remote_or_onsite") or "")
+
+    def test_location_preference_remote_fills_remote_or_onsite(self):
+        body = (
+            "Project Logistics\n"
+            "Location Preference: Remote\n"
+            "Start Date: Aug 10, 2026\n"
+            "Expected Project Length: 3-4 months\n"
+        )
+        details = extraction.extract_detail_fields_from_body(body, title="M&A Advisor")
+        self.assertEqual(details.get("location_preference"), "Remote")
+        self.assertEqual(details.get("remote_or_onsite"), "Remote")
 
     def test_multi_paragraph_description(self):
         body = (FIXTURES / "detail_full_body.txt").read_text(encoding="utf-8")
