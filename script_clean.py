@@ -28,7 +28,7 @@ from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException
+from selenium.common.exceptions import TimeoutException, WebDriverException
 from selenium.webdriver.chrome.options import Options
 from dotenv import load_dotenv
 
@@ -75,11 +75,16 @@ class Config:
     LOGIN_RETRY_INTERVAL = int(os.getenv("LOGIN_RETRY_INTERVAL", "300"))
     CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", 60))
     MAX_AGE_MINUTES = int(os.getenv("MAX_AGE_MINUTES", 60))
-    REPOST_MIN_DAYS = int(os.getenv("REPOST_MIN_DAYS", "3"))
+    REPOST_MIN_DAYS = int(
+        os.getenv("OCCURRENCE_WINDOW_DAYS")
+        or os.getenv("REPOST_MIN_DAYS", "3")
+    )
     EMAIL_MAX_RETRIES = int(os.getenv("EMAIL_MAX_RETRIES", "5"))
     EMAIL_RETRY_BASE_MINUTES = int(os.getenv("EMAIL_RETRY_BASE_MINUTES", "15"))
     DETAIL_FETCH_DELAY_SECONDS = float(os.getenv("DETAIL_FETCH_DELAY_SECONDS", "2"))
     DETAIL_MAX_ATTEMPTS = int(os.getenv("DETAIL_MAX_ATTEMPTS", "2"))
+    TAB_CRASH_MAX_RETRIES = int(os.getenv("TAB_CRASH_MAX_RETRIES", "2"))
+    TAB_CRASH_RETRY_DELAY_SECONDS = int(os.getenv("TAB_CRASH_RETRY_DELAY_SECONDS", "120"))
     HEADLESS = os.getenv("HEADLESS", "False").lower() == "true"
     COOKIES_FILE = os.getenv("COOKIES_FILE", "catalant_cookies.json")
     SUPABASE_URL = os.getenv("SUPABASE_URL", "")
@@ -2018,6 +2023,193 @@ def safe_quit_driver(driver):
         pass
 
 
+_RECOVERABLE_BROWSER_CRASH_MARKERS = (
+    "tab crashed",
+    "session deleted because of page crash",
+    "chrome not reachable",
+    "disconnected: not connected to devtools",
+)
+
+
+def is_recoverable_browser_crash(exc: Exception) -> bool:
+    """True for Chromium/Selenium renderer/session crashes that warrant a fresh driver."""
+    parts = [str(exc or "")]
+    cause = getattr(exc, "__cause__", None)
+    if cause is not None:
+        parts.append(str(cause))
+    ctx = getattr(exc, "__context__", None)
+    if ctx is not None and ctx is not cause:
+        parts.append(str(ctx))
+    message = " ".join(parts).lower()
+    return any(marker in message for marker in _RECOVERABLE_BROWSER_CRASH_MARKERS)
+
+
+def _sleep_interruptible(seconds: float, *, chunk_seconds: float = 1.0) -> None:
+    """Sleep in short chunks so KeyboardInterrupt can stop recovery promptly."""
+    remaining = max(0.0, float(seconds))
+    while remaining > 0:
+        step = min(chunk_seconds, remaining)
+        time.sleep(step)
+        remaining -= step
+
+
+def recreate_authenticated_driver(old_driver=None):
+    """
+    Quit a broken driver (if any), create a fresh ChromeDriver, restore Catalant session.
+    Returns (driver, session_result).
+    """
+    if old_driver is not None:
+        try:
+            safe_quit_driver(old_driver)
+            print(
+                "event=browser_driver_quit_attempted "
+                "operation=browser_crash_recovery status=ok"
+            )
+        except Exception as quit_err:
+            print(
+                "event=browser_driver_quit_attempted "
+                f"operation=browser_crash_recovery status=failed "
+                f"error={redact_sensitive_text(quit_err)}"
+            )
+    print("event=browser_driver_create_start operation=browser_crash_recovery")
+    driver = initialize_driver()
+    print("event=browser_driver_create_complete operation=browser_crash_recovery")
+    print("event=browser_auth_restore_start operation=browser_crash_recovery")
+    session = setup_session(driver)
+    if session.get("success"):
+        print(
+            "event=browser_auth_restore_complete "
+            "operation=browser_crash_recovery status=ok "
+            f"method={session.get('message') or 'session'}"
+        )
+    else:
+        print(
+            "event=browser_auth_restore_complete "
+            "operation=browser_crash_recovery status=failed "
+            f"classification={session.get('classification')}"
+        )
+    return driver, session
+
+
+def run_monitoring_cycle_with_browser_recovery(
+    driver,
+    *,
+    cold_start_pending,
+    dry_run=False,
+    debug_extraction=False,
+    run_once=False,
+    check_number=0,
+):
+    """
+    Run one monitoring cycle; on recoverable Chromium crashes recreate the driver,
+    restore auth, and retry the full cycle up to TAB_CRASH_MAX_RETRIES times.
+
+    Returns (driver, cold_start_pending).
+    Raises the last crash (or auth failure) after retries are exhausted.
+    Does not send MONITORING_CYCLE:FAILED — caller handles final alerting.
+    """
+    global _monitor_state
+    max_retries = max(0, int(Config.TAB_CRASH_MAX_RETRIES))
+    delay_seconds = max(0, int(Config.TAB_CRASH_RETRY_DELAY_SECONDS))
+    last_crash = None
+
+    for attempt in range(max_retries + 1):
+        try:
+            cold_start_pending = run_monitoring_cycle(
+                driver,
+                cold_start_pending=cold_start_pending,
+                dry_run=dry_run,
+                debug_extraction=debug_extraction,
+                run_once=run_once,
+            )
+            if attempt > 0:
+                print(
+                    "event=browser_crash_recovery_success "
+                    "operation=monitoring_cycle "
+                    f"check_number={check_number} "
+                    f"recovery_attempt={attempt} "
+                    f"max_recovery_attempts={max_retries}"
+                )
+            return driver, cold_start_pending
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:
+            if not is_recoverable_browser_crash(exc):
+                raise
+            last_crash = exc
+            sanitized = redact_sensitive_text(exc)
+            print(
+                "event=browser_crash_detected "
+                "operation=monitoring_cycle "
+                f"check_number={check_number} "
+                f"recovery_attempt={attempt + 1} "
+                f"max_recovery_attempts={max_retries} "
+                f"retry_delay_seconds={delay_seconds} "
+                f"error={sanitized}"
+            )
+            if attempt >= max_retries:
+                print(
+                    "event=browser_crash_recovery_exhausted "
+                    "operation=monitoring_cycle "
+                    f"check_number={check_number} "
+                    f"recovery_attempts={max_retries} "
+                    "recovery_exhausted=true "
+                    f"last_browser_error={sanitized}"
+                )
+                raise
+
+            print(
+                "event=browser_crash_recovery_delay_start "
+                "operation=monitoring_cycle "
+                f"retry_delay_seconds={delay_seconds}"
+            )
+            previous_monitor_state = _monitor_state
+            _monitor_state = "browser_recovery"
+            try:
+                _sleep_interruptible(delay_seconds)
+            finally:
+                _monitor_state = previous_monitor_state
+
+            print(
+                "event=browser_crash_recovery_recreate "
+                "operation=monitoring_cycle "
+                "driver_recreated=true"
+            )
+            driver, session = recreate_authenticated_driver(driver)
+            if not session.get("success"):
+                auth_err = RuntimeError(
+                    session.get("message")
+                    or session.get("classification")
+                    or "Authentication restore failed after browser crash"
+                )
+                if not session.get("alert_sent"):
+                    send_error_notification(
+                        "BROWSER_RECOVERY:AUTH_FAILED",
+                        auth_err,
+                        details=(
+                            f"check_number={check_number}\n"
+                            f"recovery_attempt={attempt + 1}\n"
+                            f"classification={session.get('classification')}"
+                        ),
+                        diagnostics={
+                            **_safe_driver_info(driver),
+                            "operation": "browser_crash_auth_restore",
+                        },
+                    )
+                raise auth_err from last_crash
+
+            print(
+                "event=browser_crash_recovery_retry_start "
+                "operation=monitoring_cycle "
+                f"check_number={check_number} "
+                f"recovery_attempt={attempt + 1}"
+            )
+
+    if last_crash is not None:
+        raise last_crash
+    return driver, cold_start_pending
+
+
 def _navigate_to_search(driver):
     """Navigate to Search Projects page. Loads dashboard first so the AJAX session is active."""
     driver.get(DASHBOARD_URL)
@@ -2532,12 +2724,13 @@ def main(run_once=False, dry_run=False, debug_extraction=False):
                 print(f"🔄 Check #{check_count} - {datetime.now(PKT).strftime('%H:%M:%S')} PKT")
                 print(f"{'='*30}")
 
-                cold_start_pending = run_monitoring_cycle(
+                driver, cold_start_pending = run_monitoring_cycle_with_browser_recovery(
                     driver,
                     cold_start_pending=cold_start_pending,
                     dry_run=dry_run,
                     debug_extraction=debug_extraction,
                     run_once=run_once,
+                    check_number=check_count,
                 )
 
                 if run_once or dry_run:
@@ -2550,20 +2743,36 @@ def main(run_once=False, dry_run=False, debug_extraction=False):
             except KeyboardInterrupt:
                 raise
             except Exception as loop_err:
+                sanitized = redact_sensitive_text(loop_err)
+                crash = is_recoverable_browser_crash(loop_err)
                 print(
-                    f"⚠️ Check failed: {redact_sensitive_text(loop_err)} — "
+                    f"⚠️ Check failed: {sanitized} — "
                     f"retrying in {Config.CHECK_INTERVAL}s..."
                 )
+                alert_details = (
+                    f"check_number={check_count}\n"
+                    f"monitor_state={_monitor_state}\n"
+                    f"last_successful_scan={_last_successful_scan_at}"
+                )
+                if crash:
+                    alert_details += (
+                        f"\nrecovery_attempts={Config.TAB_CRASH_MAX_RETRIES}\n"
+                        "recovery_exhausted=true\n"
+                        f"last_browser_error={sanitized}"
+                    )
                 send_error_notification(
                     "MONITORING_CYCLE:FAILED",
                     loop_err,
-                    details=(
-                        f"check_number={check_count}\n"
-                        f"monitor_state={_monitor_state}\n"
-                        f"last_successful_scan={_last_successful_scan_at}"
-                    ),
+                    details=alert_details,
                     traceback_text=traceback.format_exc(),
-                    diagnostics={**_safe_driver_info(driver), "operation": "monitoring_cycle"},
+                    diagnostics={
+                        **_safe_driver_info(driver),
+                        "operation": "monitoring_cycle",
+                        "recovery_exhausted": crash,
+                        "recovery_attempts": (
+                            Config.TAB_CRASH_MAX_RETRIES if crash else 0
+                        ),
+                    },
                 )
                 if run_once or dry_run:
                     break

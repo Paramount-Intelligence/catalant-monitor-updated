@@ -38,7 +38,7 @@ Every platform scraper should keep these behaviors identical:
 | Rule | Behavior |
 | --- | --- |
 | Occurrence rows | Insert a **new** `projects` row when eligible (no unique constraint on `platform + project_id`) |
-| 3-day rule | Skip insert + email when latest row for `(platform, project_id)` has `scraped_at` age ≤ 3 days |
+| 3-day rule | Skip insert + email when latest row for `(platform, project_id)` has `scraped_at` age ≤ `OCCURRENCE_WINDOW_DAYS` / `REPOST_MIN_DAYS` (default 3) |
 | Cold start | First successful scan seeds existing listings as `SUPPRESSED` / `COLD_START_SEED` (no project emails) |
 | Detail before insert | Fetch detail page (when the site has one) before inserting a seed or eligible occurrence |
 | Enrichment | Update the **same** `projects.id` for missing detail fields; never create a row only to fill columns |
@@ -213,6 +213,14 @@ limit 50;
 
 There is **no** unique constraint on `(platform, project_id)`. The same marketplace project may appear as multiple occurrence rows over time.
 
+Window length is env-controlled:
+
+```text
+OCCURRENCE_WINDOW_DAYS   # preferred
+REPOST_MIN_DAYS          # fallback if OCCURRENCE_WINDOW_DAYS unset
+# default: 3
+```
+
 Eligibility query:
 
 ```text
@@ -225,8 +233,8 @@ limit 1
 | Latest row | Decision |
 | --- | --- |
 | None | Eligible — insert new occurrence + email |
-| `now - scraped_at` **> 3 days** | Eligible — insert new occurrence + email |
-| `now - scraped_at` **≤ 3 days** (including exactly 3 days) | Skip — no insert, no email |
+| `now - scraped_at` **> N days** | Eligible — insert new occurrence + email |
+| `now - scraped_at` **≤ N days** (including exactly N days) | Skip — no insert, no email |
 
 Comparison uses timezone-aware UTC and **`projects.scraped_at` only** (not website “Posted …” text).
 

@@ -260,6 +260,32 @@ class EligibilityTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertIn("eligible_after_", reason)
 
+    def test_occurrence_window_days_from_env(self):
+        now = datetime(2026, 7, 31, 12, 0, tzinfo=timezone.utc)
+        self.store["projects"].append(
+            {
+                "id": "row1",
+                "platform": "catalant",
+                "project_id": "p1",
+                "scraped_at": (now - timedelta(days=4)).isoformat(),
+                "email_status": "SENT",
+                "email_sent": True,
+            }
+        )
+        with mock.patch.dict(
+            os.environ,
+            {"OCCURRENCE_WINDOW_DAYS": "5", "REPOST_MIN_DAYS": "3"},
+            clear=False,
+        ):
+            ok, reason, _ = db.should_process_project("catalant", "p1", now=now)
+            self.assertFalse(ok)
+            self.assertIn("skipped_within_5_days", reason)
+            # Exactly 5 days still skipped; 5 days + 1s eligible
+            self.store["projects"][0]["scraped_at"] = (now - timedelta(days=5, seconds=1)).isoformat()
+            ok2, reason2, _ = db.should_process_project("catalant", "p1", now=now)
+            self.assertTrue(ok2)
+            self.assertIn("eligible_after_", reason2)
+
     def test_same_id_different_platforms_independent(self):
         now = datetime(2026, 7, 31, 12, 0, tzinfo=timezone.utc)
         self.store["projects"].append(

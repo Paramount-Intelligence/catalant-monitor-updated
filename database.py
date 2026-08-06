@@ -19,7 +19,35 @@ PLATFORM_CATALANT = "catalant"
 SCRAPER_NAME = "catalant-monitor"
 SCRAPER_VERSION = "2.0.0"
 
-THREE_DAY_WINDOW = timedelta(days=3)
+
+def get_occurrence_window_days() -> int:
+    """
+    Days between eligible re-occurrences for the same platform + project_id.
+
+    Env (first match wins):
+      OCCURRENCE_WINDOW_DAYS
+      REPOST_MIN_DAYS
+    Default: 3
+    """
+    raw = os.getenv("OCCURRENCE_WINDOW_DAYS")
+    if raw is None or str(raw).strip() == "":
+        raw = os.getenv("REPOST_MIN_DAYS", "3")
+    try:
+        days = int(str(raw).strip())
+    except (TypeError, ValueError) as exc:
+        raise SupabaseConfigError(
+            f"OCCURRENCE_WINDOW_DAYS/REPOST_MIN_DAYS must be an integer, got {raw!r}"
+        ) from exc
+    if days < 0:
+        raise SupabaseConfigError(
+            f"OCCURRENCE_WINDOW_DAYS/REPOST_MIN_DAYS must be >= 0, got {days}"
+        )
+    return days
+
+
+def get_occurrence_window() -> timedelta:
+    return timedelta(days=get_occurrence_window_days())
+
 
 _supabase_client = None
 
@@ -417,10 +445,11 @@ def should_process_project(
     now: Optional[datetime] = None,
 ) -> tuple[bool, str, Optional[dict]]:
     """
-    Three-day repeated-project rule based on projects.scraped_at (UTC).
+    Repeated-project rule based on projects.scraped_at (UTC).
 
+    Window days from OCCURRENCE_WINDOW_DAYS or REPOST_MIN_DAYS (default 3).
     Returns (eligible, reason, latest_row).
-    age > 3 days → eligible; age <= 3 days (including exactly 3 days) → skip.
+    age > N days → eligible; age <= N days (including exactly N days) → skip.
     """
     latest = get_latest_project_occurrence(platform, project_id)
     if latest is None:
@@ -439,10 +468,16 @@ def should_process_project(
     else:
         current = current.astimezone(timezone.utc)
 
+    window_days = get_occurrence_window_days()
+    window = timedelta(days=window_days)
     age = current - scraped_at
-    if age > THREE_DAY_WINDOW:
+    if age > window:
         return True, f"eligible_after_{age.total_seconds():.0f}s", latest
-    return False, f"skipped_within_3_days_age_{age.total_seconds():.0f}s", latest
+    return (
+        False,
+        f"skipped_within_{window_days}_days_age_{age.total_seconds():.0f}s",
+        latest,
+    )
 
 
 def platform_has_projects(platform: str) -> bool:
