@@ -84,7 +84,8 @@ class Config:
     DETAIL_FETCH_DELAY_SECONDS = float(os.getenv("DETAIL_FETCH_DELAY_SECONDS", "2"))
     DETAIL_MAX_ATTEMPTS = int(os.getenv("DETAIL_MAX_ATTEMPTS", "2"))
     TAB_CRASH_MAX_RETRIES = int(os.getenv("TAB_CRASH_MAX_RETRIES", "2"))
-    TAB_CRASH_RETRY_DELAY_SECONDS = int(os.getenv("TAB_CRASH_RETRY_DELAY_SECONDS", "120"))
+    # Delay before recreating the driver and retrying a failed cycle (any error).
+    TAB_CRASH_RETRY_DELAY_SECONDS = int(os.getenv("TAB_CRASH_RETRY_DELAY_SECONDS", "60"))
     HEADLESS = os.getenv("HEADLESS", "False").lower() == "true"
     COOKIES_FILE = os.getenv("COOKIES_FILE", "catalant_cookies.json")
     SUPABASE_URL = os.getenv("SUPABASE_URL", "")
@@ -1203,6 +1204,7 @@ def scan_for_projects(driver):
             )
         return projects
     except TimeoutException as e:
+        # Re-raise so cycle recovery can retry after the configured delay.
         print("⏳ Timeout waiting for projects")
         last_scan_issue = {
             "classification": "SCAN:TIMEOUT",
@@ -1210,15 +1212,10 @@ def scan_for_projects(driver):
             "alert_sent": False,
             "selector": selector,
         }
-        last_scan_issue["alert_sent"] = send_error_notification(
-            "SCAN:TIMEOUT",
-            e,
-            details=f"selector={selector}\npage_text={_safe_page_text(driver, 1500)}",
-            traceback_text=traceback.format_exc(),
-            diagnostics={**_safe_driver_info(driver), "selector": selector},
-        )
-        return []
+        raise
     except Exception as e:
+        # Re-raise (including tab crashed) so recovery retries the full cycle.
+        # Alerts are deferred until recovery attempts are exhausted.
         print(f"❌ Error scanning: {redact_sensitive_text(e)}")
         last_scan_issue = {
             "classification": "SCAN:PROJECT_LIST_FAILED",
@@ -1226,14 +1223,7 @@ def scan_for_projects(driver):
             "alert_sent": False,
             "selector": selector,
         }
-        last_scan_issue["alert_sent"] = send_error_notification(
-            "SCAN:PROJECT_LIST_FAILED",
-            e,
-            details=f"selector={selector}\npage_text={_safe_page_text(driver, 1500)}",
-            traceback_text=traceback.format_exc(),
-            diagnostics={**_safe_driver_info(driver), "selector": selector},
-        )
-        return []
+        raise
 
 # ============================
 # PROJECT DATABASE (Supabase)
@@ -2101,11 +2091,11 @@ def run_monitoring_cycle_with_browser_recovery(
     check_number=0,
 ):
     """
-    Run one monitoring cycle; on recoverable Chromium crashes recreate the driver,
+    Run one monitoring cycle; on any cycle error wait, recreate the driver,
     restore auth, and retry the full cycle up to TAB_CRASH_MAX_RETRIES times.
 
     Returns (driver, cold_start_pending).
-    Raises the last crash (or auth failure) after retries are exhausted.
+    Raises the last error (or auth failure) after retries are exhausted.
     Does not send MONITORING_CYCLE:FAILED — caller handles final alerting.
     """
     global _monitor_state
@@ -2124,7 +2114,7 @@ def run_monitoring_cycle_with_browser_recovery(
             )
             if attempt > 0:
                 print(
-                    "event=browser_crash_recovery_success "
+                    "event=cycle_recovery_success "
                     "operation=monitoring_cycle "
                     f"check_number={check_number} "
                     f"recovery_attempt={attempt} "
@@ -2134,32 +2124,33 @@ def run_monitoring_cycle_with_browser_recovery(
         except KeyboardInterrupt:
             raise
         except Exception as exc:
-            if not is_recoverable_browser_crash(exc):
-                raise
+            # Retry any cycle/scan/browser error (not only tab crashes).
             last_crash = exc
             sanitized = redact_sensitive_text(exc)
+            crash = is_recoverable_browser_crash(exc)
             print(
-                "event=browser_crash_detected "
+                "event=cycle_error_detected "
                 "operation=monitoring_cycle "
                 f"check_number={check_number} "
                 f"recovery_attempt={attempt + 1} "
                 f"max_recovery_attempts={max_retries} "
                 f"retry_delay_seconds={delay_seconds} "
+                f"browser_crash={str(crash).lower()} "
                 f"error={sanitized}"
             )
             if attempt >= max_retries:
                 print(
-                    "event=browser_crash_recovery_exhausted "
+                    "event=cycle_recovery_exhausted "
                     "operation=monitoring_cycle "
                     f"check_number={check_number} "
                     f"recovery_attempts={max_retries} "
                     "recovery_exhausted=true "
-                    f"last_browser_error={sanitized}"
+                    f"last_error={sanitized}"
                 )
                 raise
 
             print(
-                "event=browser_crash_recovery_delay_start "
+                "event=cycle_recovery_delay_start "
                 "operation=monitoring_cycle "
                 f"retry_delay_seconds={delay_seconds}"
             )
@@ -2171,7 +2162,7 @@ def run_monitoring_cycle_with_browser_recovery(
                 _monitor_state = previous_monitor_state
 
             print(
-                "event=browser_crash_recovery_recreate "
+                "event=cycle_recovery_recreate "
                 "operation=monitoring_cycle "
                 "driver_recreated=true"
             )
@@ -2180,7 +2171,7 @@ def run_monitoring_cycle_with_browser_recovery(
                 auth_err = RuntimeError(
                     session.get("message")
                     or session.get("classification")
-                    or "Authentication restore failed after browser crash"
+                    or "Authentication restore failed after cycle error"
                 )
                 if not session.get("alert_sent"):
                     send_error_notification(
@@ -2199,7 +2190,7 @@ def run_monitoring_cycle_with_browser_recovery(
                 raise auth_err from last_crash
 
             print(
-                "event=browser_crash_recovery_retry_start "
+                "event=cycle_recovery_retry_start "
                 "operation=monitoring_cycle "
                 f"check_number={check_number} "
                 f"recovery_attempt={attempt + 1}"
@@ -2744,7 +2735,6 @@ def main(run_once=False, dry_run=False, debug_extraction=False):
                 raise
             except Exception as loop_err:
                 sanitized = redact_sensitive_text(loop_err)
-                crash = is_recoverable_browser_crash(loop_err)
                 print(
                     f"⚠️ Check failed: {sanitized} — "
                     f"retrying in {Config.CHECK_INTERVAL}s..."
@@ -2752,14 +2742,11 @@ def main(run_once=False, dry_run=False, debug_extraction=False):
                 alert_details = (
                     f"check_number={check_count}\n"
                     f"monitor_state={_monitor_state}\n"
-                    f"last_successful_scan={_last_successful_scan_at}"
+                    f"last_successful_scan={_last_successful_scan_at}\n"
+                    f"recovery_attempts={Config.TAB_CRASH_MAX_RETRIES}\n"
+                    "recovery_exhausted=true\n"
+                    f"last_error={sanitized}"
                 )
-                if crash:
-                    alert_details += (
-                        f"\nrecovery_attempts={Config.TAB_CRASH_MAX_RETRIES}\n"
-                        "recovery_exhausted=true\n"
-                        f"last_browser_error={sanitized}"
-                    )
                 send_error_notification(
                     "MONITORING_CYCLE:FAILED",
                     loop_err,
@@ -2768,10 +2755,9 @@ def main(run_once=False, dry_run=False, debug_extraction=False):
                     diagnostics={
                         **_safe_driver_info(driver),
                         "operation": "monitoring_cycle",
-                        "recovery_exhausted": crash,
-                        "recovery_attempts": (
-                            Config.TAB_CRASH_MAX_RETRIES if crash else 0
-                        ),
+                        "recovery_exhausted": True,
+                        "recovery_attempts": Config.TAB_CRASH_MAX_RETRIES,
+                        "browser_crash": is_recoverable_browser_crash(loop_err),
                     },
                 )
                 if run_once or dry_run:

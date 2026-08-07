@@ -1,11 +1,11 @@
-"""Tests for Chromium tab-crash recovery around monitoring cycles."""
+"""Tests for cycle error recovery (browser crash, scan failures, etc.)."""
 
 from __future__ import annotations
 
 import unittest
 from unittest import mock
 
-from selenium.common.exceptions import WebDriverException
+from selenium.common.exceptions import TimeoutException, WebDriverException
 
 import script_clean as sc
 
@@ -37,7 +37,7 @@ class RecoverableCrashClassificationTests(unittest.TestCase):
             )
         )
 
-    def test_unrelated_webdriver_exception_not_recoverable(self):
+    def test_unrelated_webdriver_exception_not_classified_as_crash(self):
         self.assertFalse(
             sc.is_recoverable_browser_crash(
                 WebDriverException("invalid session id: browser has closed the connection")
@@ -53,7 +53,7 @@ class BrowserCrashRecoveryFlowTests(unittest.TestCase):
         self.old_retries = sc.Config.TAB_CRASH_MAX_RETRIES
         self.old_delay = sc.Config.TAB_CRASH_RETRY_DELAY_SECONDS
         sc.Config.TAB_CRASH_MAX_RETRIES = 2
-        sc.Config.TAB_CRASH_RETRY_DELAY_SECONDS = 120
+        sc.Config.TAB_CRASH_RETRY_DELAY_SECONDS = 60
 
     def tearDown(self):
         sc.Config.TAB_CRASH_MAX_RETRIES = self.old_retries
@@ -93,8 +93,7 @@ class BrowserCrashRecoveryFlowTests(unittest.TestCase):
         self.assertFalse(cold)
         self.assertEqual(cycle.call_count, 2)
         quit_mock.assert_called()
-        # First arg to safe_quit should be the crashed driver (via recreate)
-        sleep_mock.assert_called_once_with(120)
+        sleep_mock.assert_called_once_with(60)
         init_mock.assert_called_once()
         setup_mock.assert_called_once_with(new_driver)
         self.assertEqual(alerts, [])  # no intermediate MONITORING_CYCLE:FAILED
@@ -156,24 +155,67 @@ class BrowserCrashRecoveryFlowTests(unittest.TestCase):
                     mock.Mock(), cold_start_pending=False, check_number=3
                 )
 
-        # Initial attempt + 2 retries = 3 cycle calls; 2 recovery sleeps
         self.assertEqual(cycle.call_count, 3)
         self.assertEqual(sleep_mock.call_count, 2)
-        sleep_mock.assert_called_with(120)
+        sleep_mock.assert_called_with(60)
         self.assertNotIn("MONITORING_CYCLE:FAILED", alerts)
 
-    def test_unrelated_exception_bypasses_recovery(self):
-        with mock.patch.object(
-            sc, "run_monitoring_cycle", side_effect=WebDriverException("element not interactable")
-        ), mock.patch.object(sc, "_sleep_interruptible") as sleep_mock, mock.patch.object(
-            sc, "initialize_driver"
-        ) as init_mock:
+    def test_any_cycle_error_triggers_recovery(self):
+        """Non-crash scan/cycle errors also retry after the configured delay."""
+        old_driver = mock.Mock(name="old_driver")
+        new_driver = mock.Mock(name="new_driver")
+        cycle = mock.Mock(side_effect=[RuntimeError("scan failed"), False])
+
+        with mock.patch.object(sc, "run_monitoring_cycle", cycle), mock.patch.object(
+            sc, "_sleep_interruptible"
+        ) as sleep_mock, mock.patch.object(sc, "safe_quit_driver"), mock.patch.object(
+            sc, "initialize_driver", return_value=new_driver
+        ), mock.patch.object(
+            sc,
+            "setup_session",
+            return_value={"success": True, "alert_sent": False, "message": "cookies"},
+        ), mock.patch.object(sc, "send_error_notification"):
+            driver_out, cold = sc.run_monitoring_cycle_with_browser_recovery(
+                old_driver, cold_start_pending=False, check_number=1
+            )
+
+        self.assertIs(driver_out, new_driver)
+        self.assertFalse(cold)
+        self.assertEqual(cycle.call_count, 2)
+        sleep_mock.assert_called_once_with(60)
+
+    def test_scan_for_projects_reraises_without_immediate_alert(self):
+        driver = mock.Mock()
+        driver.find_elements.side_effect = WebDriverException("tab crashed")
+        alerts = []
+
+        with mock.patch.object(sc, "WebDriverWait") as wait_cls, mock.patch.object(
+            sc,
+            "send_error_notification",
+            side_effect=lambda *a, **k: alerts.append(a[0] if a else None),
+        ):
+            wait_cls.return_value.until.return_value = True
             with self.assertRaises(WebDriverException):
-                sc.run_monitoring_cycle_with_browser_recovery(
-                    mock.Mock(), cold_start_pending=False, check_number=1
-                )
-        sleep_mock.assert_not_called()
-        init_mock.assert_not_called()
+                sc.scan_for_projects(driver)
+
+        self.assertEqual(alerts, [])
+        self.assertEqual(sc.last_scan_issue["classification"], "SCAN:PROJECT_LIST_FAILED")
+
+    def test_scan_for_projects_timeout_reraises_without_immediate_alert(self):
+        driver = mock.Mock()
+        alerts = []
+
+        with mock.patch.object(sc, "WebDriverWait") as wait_cls, mock.patch.object(
+            sc,
+            "send_error_notification",
+            side_effect=lambda *a, **k: alerts.append(a[0] if a else None),
+        ):
+            wait_cls.return_value.until.side_effect = TimeoutException("timed out")
+            with self.assertRaises(TimeoutException):
+                sc.scan_for_projects(driver)
+
+        self.assertEqual(alerts, [])
+        self.assertEqual(sc.last_scan_issue["classification"], "SCAN:TIMEOUT")
 
 
 if __name__ == "__main__":
