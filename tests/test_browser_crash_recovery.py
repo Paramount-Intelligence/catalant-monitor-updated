@@ -63,7 +63,7 @@ class BrowserCrashRecoveryFlowTests(unittest.TestCase):
         old_driver = mock.Mock(name="old_driver")
         new_driver = mock.Mock(name="new_driver")
         crash = WebDriverException("Message: tab crashed")
-        cycle = mock.Mock(side_effect=[crash, False])
+        cycle = mock.Mock(side_effect=[crash, (False, False)])
         alerts = []
 
         def capture_alert(*args, **kwargs):
@@ -82,21 +82,23 @@ class BrowserCrashRecoveryFlowTests(unittest.TestCase):
         ) as setup_mock, mock.patch.object(
             sc, "send_error_notification", side_effect=capture_alert
         ):
-            driver_out, cold = sc.run_monitoring_cycle_with_browser_recovery(
+            driver_out, cold, first = sc.run_monitoring_cycle_with_browser_recovery(
                 old_driver,
                 cold_start_pending=True,
+                first_run_seed_pending=True,
                 dry_run=True,
                 check_number=7,
             )
 
         self.assertIs(driver_out, new_driver)
         self.assertFalse(cold)
+        self.assertFalse(first)
         self.assertEqual(cycle.call_count, 2)
         quit_mock.assert_called()
         sleep_mock.assert_called_once_with(60)
         init_mock.assert_called_once()
         setup_mock.assert_called_once_with(new_driver)
-        self.assertEqual(alerts, [])  # no intermediate MONITORING_CYCLE:FAILED
+        self.assertEqual(alerts, [])
 
     def test_broken_driver_quit_before_new_driver(self):
         order = []
@@ -113,7 +115,7 @@ class BrowserCrashRecoveryFlowTests(unittest.TestCase):
         with mock.patch.object(
             sc,
             "run_monitoring_cycle",
-            side_effect=[WebDriverException("tab crashed"), False],
+            side_effect=[WebDriverException("tab crashed"), (False, False)],
         ), mock.patch.object(sc, "_sleep_interruptible"), mock.patch.object(
             sc, "safe_quit_driver", side_effect=quit_side_effect
         ), mock.patch.object(
@@ -164,7 +166,7 @@ class BrowserCrashRecoveryFlowTests(unittest.TestCase):
         """Non-crash scan/cycle errors also retry after the configured delay."""
         old_driver = mock.Mock(name="old_driver")
         new_driver = mock.Mock(name="new_driver")
-        cycle = mock.Mock(side_effect=[RuntimeError("scan failed"), False])
+        cycle = mock.Mock(side_effect=[RuntimeError("scan failed"), (False, False)])
 
         with mock.patch.object(sc, "run_monitoring_cycle", cycle), mock.patch.object(
             sc, "_sleep_interruptible"
@@ -175,12 +177,13 @@ class BrowserCrashRecoveryFlowTests(unittest.TestCase):
             "setup_session",
             return_value={"success": True, "alert_sent": False, "message": "cookies"},
         ), mock.patch.object(sc, "send_error_notification"):
-            driver_out, cold = sc.run_monitoring_cycle_with_browser_recovery(
+            driver_out, cold, first = sc.run_monitoring_cycle_with_browser_recovery(
                 old_driver, cold_start_pending=False, check_number=1
             )
 
         self.assertIs(driver_out, new_driver)
         self.assertFalse(cold)
+        self.assertFalse(first)
         self.assertEqual(cycle.call_count, 2)
         sleep_mock.assert_called_once_with(60)
 

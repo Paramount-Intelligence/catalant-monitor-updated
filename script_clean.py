@@ -34,6 +34,7 @@ from dotenv import load_dotenv
 
 import database as db
 import extraction
+import browser_process
 
 # Load environment variables
 load_dotenv()
@@ -71,7 +72,7 @@ class Config:
         for email in _ERROR_RECIPIENTS_RAW.split(",")
         if email.strip()
     ]
-    ERROR_EMAIL_COOLDOWN_MINUTES = int(os.getenv("ERROR_EMAIL_COOLDOWN_MINUTES", "30"))
+    ERROR_EMAIL_COOLDOWN_MINUTES = int(os.getenv("ERROR_EMAIL_COOLDOWN_MINUTES", "0"))
     LOGIN_RETRY_INTERVAL = int(os.getenv("LOGIN_RETRY_INTERVAL", "300"))
     CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", 60))
     MAX_AGE_MINUTES = int(os.getenv("MAX_AGE_MINUTES", 60))
@@ -86,6 +87,21 @@ class Config:
     TAB_CRASH_MAX_RETRIES = int(os.getenv("TAB_CRASH_MAX_RETRIES", "2"))
     # Delay before recreating the driver and retrying a failed cycle (any error).
     TAB_CRASH_RETRY_DELAY_SECONDS = int(os.getenv("TAB_CRASH_RETRY_DELAY_SECONDS", "60"))
+    # false = first process scan may email; empty-platform cold start still suppresses.
+    SUPPRESS_PROJECT_EMAILS_ON_FIRST_SCAN = (
+        os.getenv("SUPPRESS_PROJECT_EMAILS_ON_FIRST_SCAN", "false").lower() == "true"
+    )
+    PROCESS_RECYCLE_HOURS = float(os.getenv("PROCESS_RECYCLE_HOURS", "3"))
+    # 0 = unlimited (no storm caps). Kept for ops compatibility with sibling scrapers.
+    INCIDENT_CONSECUTIVE_FAILURE_THRESHOLD = int(
+        os.getenv("INCIDENT_CONSECUTIVE_FAILURE_THRESHOLD", "1")
+    )
+    INCIDENT_OPEN_AFTER_MINUTES = int(os.getenv("INCIDENT_OPEN_AFTER_MINUTES", "0"))
+    INCIDENT_REMINDER_HOURS = float(os.getenv("INCIDENT_REMINDER_HOURS", "0"))
+    INCIDENT_MAX_EMAILS = int(os.getenv("INCIDENT_MAX_EMAILS", "0"))
+    INCIDENT_MAX_EMAILS_PER_PLATFORM_DAY = int(
+        os.getenv("INCIDENT_MAX_EMAILS_PER_PLATFORM_DAY", "0")
+    )
     HEADLESS = os.getenv("HEADLESS", "False").lower() == "true"
     COOKIES_FILE = os.getenv("COOKIES_FILE", "catalant_cookies.json")
     SUPABASE_URL = os.getenv("SUPABASE_URL", "")
@@ -248,10 +264,12 @@ def build_error_signature(context, error):
 
 
 def should_send_error_alert(signature, force=False):
-    """Return (ok_to_send, remaining_seconds). Does not update last-sent timestamp."""
+    """Return (ok_to_send, remaining_seconds). Always ok when cooldown is 0."""
     if force:
         return True, 0
     cooldown_s = max(Config.ERROR_EMAIL_COOLDOWN_MINUTES, 0) * 60
+    if cooldown_s == 0:
+        return True, 0
     with _error_alert_lock:
         last = _error_alert_last_sent.get(signature)
         if last is None:
@@ -539,6 +557,8 @@ def print_startup_banner():
         print("Error recipients: (none)")
         print("Error alerts: disabled")
     print(f"Error cooldown: {Config.ERROR_EMAIL_COOLDOWN_MINUTES} minutes")
+    print(f"Suppress emails on first scan: {Config.SUPPRESS_PROJECT_EMAILS_ON_FIRST_SCAN}")
+    print(f"Process recycle hours: {Config.PROCESS_RECYCLE_HOURS}")
     print(f"Headless: {Config.HEADLESS}")
     print("=" * 50)
     ok, missing = validate_error_email_configuration()
@@ -1921,6 +1941,8 @@ def initialize_driver():
     """Initialize Chrome WebDriver"""
     from selenium.webdriver.chrome.service import Service
 
+    browser_process.reap_leftover_browser_processes(reason="before_driver_start")
+
     options = Options()
 
     if Config.HEADLESS:
@@ -1969,10 +1991,17 @@ def initialize_driver():
         })
         return driver
     except Exception as e:
-        ctx = "BROWSER_STARTUP:CHROMEDRIVER"
-        msg = str(e).lower()
-        if "chrome" in msg and "binary" in msg:
-            ctx = "BROWSER_STARTUP:CHROMIUM"
+        if browser_process.is_browser_process_exhaustion(e):
+            ctx = "BROWSER_PROCESS_EXHAUSTION"
+            try:
+                browser_process.reap_leftover_browser_processes(reason="fork_exhaustion")
+            except Exception:
+                pass
+        else:
+            ctx = "BROWSER_STARTUP:CHROMEDRIVER"
+            msg = str(e).lower()
+            if "chrome" in msg and "binary" in msg:
+                ctx = "BROWSER_STARTUP:CHROMIUM"
         send_error_notification(
             ctx,
             e,
@@ -1998,6 +2027,7 @@ SEARCH_URL = "https://app.gocatalant.com/c/_/u/0/search/?form_name=SearchForm&en
 def safe_quit_driver(driver):
     """Quit ChromeDriver without dumping urllib3/ConnectionRefused noise on Ctrl+C."""
     if driver is None:
+        browser_process.reap_leftover_browser_processes(reason="after_driver_stop")
         return
     try:
         driver.quit()
@@ -2009,6 +2039,10 @@ def safe_quit_driver(driver):
         process = getattr(getattr(driver, "service", None), "process", None)
         if process is not None:
             process.kill()
+    except Exception:
+        pass
+    try:
+        browser_process.reap_leftover_browser_processes(reason="after_driver_stop")
     except Exception:
         pass
 
@@ -2085,6 +2119,7 @@ def run_monitoring_cycle_with_browser_recovery(
     driver,
     *,
     cold_start_pending,
+    first_run_seed_pending=False,
     dry_run=False,
     debug_extraction=False,
     run_once=False,
@@ -2094,7 +2129,7 @@ def run_monitoring_cycle_with_browser_recovery(
     Run one monitoring cycle; on any cycle error wait, recreate the driver,
     restore auth, and retry the full cycle up to TAB_CRASH_MAX_RETRIES times.
 
-    Returns (driver, cold_start_pending).
+    Returns (driver, cold_start_pending, first_run_seed_pending).
     Raises the last error (or auth failure) after retries are exhausted.
     Does not send MONITORING_CYCLE:FAILED — caller handles final alerting.
     """
@@ -2105,9 +2140,10 @@ def run_monitoring_cycle_with_browser_recovery(
 
     for attempt in range(max_retries + 1):
         try:
-            cold_start_pending = run_monitoring_cycle(
+            cold_start_pending, first_run_seed_pending = run_monitoring_cycle(
                 driver,
                 cold_start_pending=cold_start_pending,
+                first_run_seed_pending=first_run_seed_pending,
                 dry_run=dry_run,
                 debug_extraction=debug_extraction,
                 run_once=run_once,
@@ -2120,7 +2156,7 @@ def run_monitoring_cycle_with_browser_recovery(
                     f"recovery_attempt={attempt} "
                     f"max_recovery_attempts={max_retries}"
                 )
-            return driver, cold_start_pending
+            return driver, cold_start_pending, first_run_seed_pending
         except KeyboardInterrupt:
             raise
         except Exception as exc:
@@ -2128,6 +2164,7 @@ def run_monitoring_cycle_with_browser_recovery(
             last_crash = exc
             sanitized = redact_sensitive_text(exc)
             crash = is_recoverable_browser_crash(exc)
+            exhaustion = browser_process.is_browser_process_exhaustion(exc)
             print(
                 "event=cycle_error_detected "
                 "operation=monitoring_cycle "
@@ -2136,6 +2173,7 @@ def run_monitoring_cycle_with_browser_recovery(
                 f"max_recovery_attempts={max_retries} "
                 f"retry_delay_seconds={delay_seconds} "
                 f"browser_crash={str(crash).lower()} "
+                f"process_exhaustion={str(exhaustion).lower()} "
                 f"error={sanitized}"
             )
             if attempt >= max_retries:
@@ -2160,6 +2198,14 @@ def run_monitoring_cycle_with_browser_recovery(
                 _sleep_interruptible(delay_seconds)
             finally:
                 _monitor_state = previous_monitor_state
+
+            if exhaustion:
+                try:
+                    browser_process.reap_leftover_browser_processes(
+                        reason="cycle_recovery_exhaustion"
+                    )
+                except Exception:
+                    pass
 
             print(
                 "event=cycle_recovery_recreate "
@@ -2198,7 +2244,7 @@ def run_monitoring_cycle_with_browser_recovery(
 
     if last_crash is not None:
         raise last_crash
-    return driver, cold_start_pending
+    return driver, cold_start_pending, first_run_seed_pending
 
 
 def _navigate_to_search(driver):
@@ -2282,11 +2328,21 @@ def process_eligible_project(driver, project, scraper_run_id, *, dry_run=False, 
     }
 
 
-def seed_cold_start(driver, projects, scraper_run_id, *, dry_run=False, debug_extraction=False):
+def seed_cold_start(
+    driver,
+    projects,
+    scraper_run_id,
+    *,
+    dry_run=False,
+    debug_extraction=False,
+    email_not_sent_reason="COLD_START_SEED",
+):
     """
-    Cold-start: fetch detail pages, insert SUPPRESSED rows, no emails / no email_attempts.
-    One failed detail does not abort the cycle.
+    Seed scan: fetch detail pages, insert SUPPRESSED rows, no emails / no email_attempts.
+    Used for empty-platform cold start (COLD_START_SEED) and optional first-run seed
+    (FIRST_RUN_SEED). One failed detail does not abort the cycle.
     """
+    reason = (email_not_sent_reason or "COLD_START_SEED").strip() or "COLD_START_SEED"
     inserted = 0
     details_attempted = details_completed = details_failed = details_partial = 0
     coverage_fields = (
@@ -2341,7 +2397,7 @@ def seed_cold_start(driver, projects, scraper_run_id, *, dry_run=False, debug_ex
                 email_status="SUPPRESSED",
                 email_eligible=False,
                 email_sent=False,
-                email_not_sent_reason="COLD_START_SEED",
+                email_not_sent_reason=reason,
             )
             inserted += 1
         except Exception as e:
@@ -2353,10 +2409,10 @@ def seed_cold_start(driver, projects, scraper_run_id, *, dry_run=False, debug_ex
             try:
                 fallback = dict(project)
                 fallback["detail_extraction_status"] = "FAILED"
-                fallback["detail_failure_code"] = "COLD_START_DETAIL_FAILED"
+                fallback["detail_failure_code"] = f"{reason}_DETAIL_FAILED"
                 fallback["detail_last_error"] = redact_sensitive_text(e)[:500]
                 fallback["extraction_warnings"] = list(
-                    set((fallback.get("extraction_warnings") or []) + ["COLD_START_DETAIL_FAILED"])
+                    set((fallback.get("extraction_warnings") or []) + [f"{reason}_DETAIL_FAILED"])
                 )
                 fallback["card_extraction_status"] = extraction.calculate_card_extraction_status(fallback)
                 fallback["missing_fields"] = extraction.compute_missing_fields(fallback)
@@ -2366,7 +2422,7 @@ def seed_cold_start(driver, projects, scraper_run_id, *, dry_run=False, debug_ex
                     email_status="SUPPRESSED",
                     email_eligible=False,
                     email_sent=False,
-                    email_not_sent_reason="COLD_START_SEED",
+                    email_not_sent_reason=reason,
                 )
                 inserted += 1
             except Exception as insert_err:
@@ -2396,6 +2452,7 @@ def seed_cold_start(driver, projects, scraper_run_id, *, dry_run=False, debug_ex
         "details_failed": details_failed,
         "details_partial": details_partial,
         "field_coverage": coverage,
+        "email_not_sent_reason": reason,
     }
 
 
@@ -2403,11 +2460,15 @@ def run_monitoring_cycle(
     driver,
     *,
     cold_start_pending,
+    first_run_seed_pending=False,
     dry_run=False,
     debug_extraction=False,
     run_once=False,
 ):
-    """One scan cycle. Returns updated cold_start_pending flag."""
+    """
+    One scan cycle.
+    Returns (cold_start_pending, first_run_seed_pending).
+    """
     run = None
     counts = {
         "cards_found": 0,
@@ -2443,35 +2504,49 @@ def run_monitoring_cycle(
             print("⚠️ No projects found")
             if run and run.get("id") and not dry_run:
                 db.complete_scraper_run(run["id"], status="PARTIAL", **counts)
-            return cold_start_pending
+            return cold_start_pending, first_run_seed_pending
 
+        def _run_seed(reason: str):
+            nonlocal counts
+            label = (
+                "cold-start (empty platform)"
+                if reason == "COLD_START_SEED"
+                else "first-run after process start"
+            )
+            print(
+                f"⚙️  Seeding {label} (detail fetch ON, emails suppressed, "
+                f"reason={reason})..."
+            )
+            seed_stats = seed_cold_start(
+                driver,
+                all_projects,
+                run.get("id") if run else None,
+                dry_run=dry_run,
+                debug_extraction=debug_extraction,
+                email_not_sent_reason=reason,
+            )
+            counts["projects_inserted"] = seed_stats["inserted"]
+            counts["emails_suppressed"] = seed_stats["inserted"]
+            counts["details_attempted"] = seed_stats["details_attempted"]
+            counts["details_completed"] = seed_stats["details_completed"]
+            counts["details_failed"] = seed_stats["details_failed"]
+            if seed_stats["inserted"] <= 0 and not dry_run:
+                raise RuntimeError(f"{reason} produced zero seeded rows")
+            if run and run.get("id") and not dry_run:
+                status = "PARTIAL" if seed_stats["details_failed"] else "COMPLETED"
+                db.complete_scraper_run(run["id"], status=status, **counts)
+            print(
+                f"✅ Seeded {seed_stats['inserted']} project(s) "
+                f"(details ok={seed_stats['details_completed']} "
+                f"failed={seed_stats['details_failed']}, reason={reason}). "
+                "Only qualifying future posts will trigger emails.\n"
+            )
+
+        # Empty-platform cold start always suppresses emails.
         if cold_start_pending:
-            print("⚙️  Seeding first successful scan (detail fetch ON, emails suppressed)...")
             try:
-                seed_stats = seed_cold_start(
-                    driver,
-                    all_projects,
-                    run.get("id") if run else None,
-                    dry_run=dry_run,
-                    debug_extraction=debug_extraction,
-                )
-                counts["projects_inserted"] = seed_stats["inserted"]
-                counts["emails_suppressed"] = seed_stats["inserted"]
-                counts["details_attempted"] = seed_stats["details_attempted"]
-                counts["details_completed"] = seed_stats["details_completed"]
-                counts["details_failed"] = seed_stats["details_failed"]
-                if seed_stats["inserted"] <= 0 and not dry_run:
-                    raise RuntimeError("Cold-start produced zero seeded rows")
-                if run and run.get("id") and not dry_run:
-                    status = "PARTIAL" if seed_stats["details_failed"] else "COMPLETED"
-                    db.complete_scraper_run(run["id"], status=status, **counts)
-                print(
-                    f"✅ Seeded {seed_stats['inserted']} existing project(s) "
-                    f"(details ok={seed_stats['details_completed']} "
-                    f"failed={seed_stats['details_failed']}). "
-                    "Only qualifying future posts will trigger emails.\n"
-                )
-                return False
+                _run_seed("COLD_START_SEED")
+                return False, False
             except Exception as seed_err:
                 notify_db_error(
                     "DATABASE:COLD_START_SEED_FAILED",
@@ -2486,10 +2561,40 @@ def run_monitoring_cycle(
                         **counts,
                     )
                 print(
-                    "⚠️  Initial seed was not confirmed; project emails remain "
+                    "⚠️  Initial cold-start seed was not confirmed; project emails remain "
                     "suppressed and seeding will retry next cycle.\n"
                 )
-                return True
+                return True, first_run_seed_pending
+
+        # Optional: first successful scan after process start seeds with emails suppressed
+        # even when the DB already has rows (fixes Check #1 spam after redeploy).
+        if first_run_seed_pending and Config.SUPPRESS_PROJECT_EMAILS_ON_FIRST_SCAN:
+            try:
+                _run_seed("FIRST_RUN_SEED")
+                return False, False
+            except Exception as seed_err:
+                notify_db_error(
+                    "DATABASE:FIRST_RUN_SEED_FAILED",
+                    seed_err,
+                    operation="first_run_seed",
+                )
+                if run and run.get("id") and not dry_run:
+                    db.fail_scraper_run(
+                        run["id"],
+                        "FIRST_RUN_SEED_FAILED",
+                        redact_sensitive_text(seed_err),
+                        **counts,
+                    )
+                print(
+                    "⚠️  First-run seed was not confirmed; will retry next cycle "
+                    "(emails remain suppressed for this seed path).\n"
+                )
+                return cold_start_pending, True
+
+        # First process scan with suppress=false: clear the flag and process normally.
+        if first_run_seed_pending:
+            first_run_seed_pending = False
+            print("⚙️  First scan after process start — project emails enabled.")
 
         # Failed-email retries (same row, no new occurrence)
         try:
@@ -2609,7 +2714,7 @@ def run_monitoring_cycle(
         if run and run.get("id") and not dry_run:
             status = "PARTIAL" if partial or counts["emails_failed"] or counts["details_failed"] else "COMPLETED"
             db.complete_scraper_run(run["id"], status=status, **counts)
-        return cold_start_pending
+        return cold_start_pending, first_run_seed_pending
     except Exception as cycle_err:
         if run and run.get("id") and not dry_run:
             try:
@@ -2629,6 +2734,10 @@ def main(run_once=False, dry_run=False, debug_extraction=False):
     global _monitor_check_count, _monitor_state, last_scan_issue
 
     print_startup_banner()
+    if not browser_process.acquire_worker_lock():
+        print("❌ Another monitor worker already holds the lock — exiting")
+        _monitor_state = "fatal"
+        return
     clean_old_evidence_files()
     _monitor_state = "starting"
 
@@ -2638,6 +2747,7 @@ def main(run_once=False, dry_run=False, debug_extraction=False):
     except Exception as e:
         print(f"❌ Browser startup failed: {redact_sensitive_text(e)}")
         _monitor_state = "fatal"
+        browser_process.release_worker_lock()
         return
 
     try:
@@ -2697,11 +2807,19 @@ def main(run_once=False, dry_run=False, debug_extraction=False):
             )
             raise
 
+        # First successful scan after this process start (optional suppress via env).
+        first_run_seed_pending = True
+
         print(f"📁 Supabase ready — platform={PLATFORM}\n")
         if cold_start_pending:
             print(
-                "⚙️  First run detected — the first successful scan will be "
-                "seeded without sending project emails.\n"
+                "⚙️  Empty platform detected — the first successful scan will be "
+                "seeded without sending project emails (COLD_START_SEED).\n"
+            )
+        elif Config.SUPPRESS_PROJECT_EMAILS_ON_FIRST_SCAN:
+            print(
+                "⚙️  First scan after process start will seed visible projects "
+                "with emails suppressed (FIRST_RUN_SEED).\n"
             )
 
         check_count = 0
@@ -2715,18 +2833,28 @@ def main(run_once=False, dry_run=False, debug_extraction=False):
                 print(f"🔄 Check #{check_count} - {datetime.now(PKT).strftime('%H:%M:%S')} PKT")
                 print(f"{'='*30}")
 
-                driver, cold_start_pending = run_monitoring_cycle_with_browser_recovery(
-                    driver,
-                    cold_start_pending=cold_start_pending,
-                    dry_run=dry_run,
-                    debug_extraction=debug_extraction,
-                    run_once=run_once,
-                    check_number=check_count,
+                driver, cold_start_pending, first_run_seed_pending = (
+                    run_monitoring_cycle_with_browser_recovery(
+                        driver,
+                        cold_start_pending=cold_start_pending,
+                        first_run_seed_pending=first_run_seed_pending,
+                        dry_run=dry_run,
+                        debug_extraction=debug_extraction,
+                        run_once=run_once,
+                        check_number=check_count,
+                    )
                 )
 
                 if run_once or dry_run:
                     print("✅ Run-once / dry-run complete")
                     break
+
+                if browser_process.should_recycle_process():
+                    browser_process.recycle_and_exit(
+                        driver=driver,
+                        quit_driver_fn=safe_quit_driver,
+                        message="PROCESS_RECYCLE_HOURS elapsed",
+                    )
 
                 print(f"\n⏳ Next check in {Config.CHECK_INTERVAL} seconds...")
                 time.sleep(Config.CHECK_INTERVAL)
@@ -2748,7 +2876,11 @@ def main(run_once=False, dry_run=False, debug_extraction=False):
                     f"last_error={sanitized}"
                 )
                 send_error_notification(
-                    "MONITORING_CYCLE:FAILED",
+                    (
+                        "BROWSER_PROCESS_EXHAUSTION"
+                        if browser_process.is_browser_process_exhaustion(loop_err)
+                        else "MONITORING_CYCLE:FAILED"
+                    ),
                     loop_err,
                     details=alert_details,
                     traceback_text=traceback.format_exc(),
@@ -2758,6 +2890,9 @@ def main(run_once=False, dry_run=False, debug_extraction=False):
                         "recovery_exhausted": True,
                         "recovery_attempts": Config.TAB_CRASH_MAX_RETRIES,
                         "browser_crash": is_recoverable_browser_crash(loop_err),
+                        "process_exhaustion": browser_process.is_browser_process_exhaustion(
+                            loop_err
+                        ),
                     },
                 )
                 if run_once or dry_run:
@@ -2801,6 +2936,7 @@ def main(run_once=False, dry_run=False, debug_extraction=False):
             )
     finally:
         safe_quit_driver(driver)
+        browser_process.release_worker_lock()
         print("✅ Monitor stopped")
 
 
