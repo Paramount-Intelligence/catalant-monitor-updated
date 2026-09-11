@@ -28,6 +28,92 @@ class TransientNetworkClassificationTests(unittest.TestCase):
             db.is_transient_supabase_network_error(Exception("duplicate key value violates unique"))
         )
 
+    def test_closed_client_is_transient(self):
+        self.assertTrue(
+            db.is_transient_supabase_network_error(
+                Exception("Cannot send a request, as the client has been closed.")
+            )
+        )
+
+    def test_ensure_schema_rebuilds_after_connection_terminated(self):
+        """ensure_schema must rebuild with a fresh client — not reuse a closed one."""
+        calls = {"n": 0}
+        clients = [mock.Mock(name="c1"), mock.Mock(name="c2")]
+
+        def build_fn(client):
+            builder = mock.Mock()
+            calls["n"] += 1
+            if calls["n"] == 1:
+                builder.execute.side_effect = Exception(
+                    "<ConnectionTerminated error_code:0, last_stream_id:3>"
+                )
+            else:
+                resp = mock.Mock()
+                resp.data = [{"id": "ok"}]
+                builder.execute.return_value = resp
+            return builder
+
+        old_retries = db._SUPABASE_MAX_RETRIES
+        old_delay = db._SUPABASE_RETRY_BASE_SECONDS
+        db._SUPABASE_MAX_RETRIES = 2
+        db._SUPABASE_RETRY_BASE_SECONDS = 0
+        try:
+            with mock.patch.object(db, "get_supabase_client", side_effect=clients), mock.patch.object(
+                db, "reset_supabase_client"
+            ) as reset_mock:
+                result = db._execute(
+                    "ensure_schema",
+                    "projects",
+                    build_fn=build_fn,
+                )
+            self.assertEqual(result.data[0]["id"], "ok")
+            self.assertEqual(calls["n"], 2)
+            reset_mock.assert_called()
+        finally:
+            db._SUPABASE_MAX_RETRIES = old_retries
+            db._SUPABASE_RETRY_BASE_SECONDS = old_delay
+
+    def test_closed_client_after_reset_recovers_with_build_fn(self):
+        calls = {"n": 0}
+
+        def build_fn(client):
+            builder = mock.Mock()
+            calls["n"] += 1
+            if calls["n"] == 1:
+                builder.execute.side_effect = Exception(
+                    "<ConnectionTerminated error_code:0>"
+                )
+            elif calls["n"] == 2:
+                # Simulate the previous bug: closed client reused without rebuild
+                # With build_fn this path gets a NEW builder instead.
+                builder.execute.side_effect = Exception(
+                    "Cannot send a request, as the client has been closed."
+                )
+            else:
+                resp = mock.Mock()
+                resp.data = [{"id": "recovered"}]
+                builder.execute.return_value = resp
+            return builder
+
+        old_retries = db._SUPABASE_MAX_RETRIES
+        old_delay = db._SUPABASE_RETRY_BASE_SECONDS
+        db._SUPABASE_MAX_RETRIES = 3
+        db._SUPABASE_RETRY_BASE_SECONDS = 0
+        try:
+            with mock.patch.object(db, "get_supabase_client", return_value=mock.Mock()), mock.patch.object(
+                db, "reset_supabase_client"
+            ):
+                result = db._execute(
+                    "ensure_schema",
+                    "projects",
+                    build_fn=build_fn,
+                )
+            self.assertEqual(result.data[0]["id"], "recovered")
+            self.assertEqual(calls["n"], 3)
+        finally:
+            db._SUPABASE_MAX_RETRIES = old_retries
+            db._SUPABASE_RETRY_BASE_SECONDS = old_delay
+
 
 class ExecuteRetryTests(unittest.TestCase):
     def setUp(self):

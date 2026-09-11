@@ -41,6 +41,9 @@ _TRANSIENT_NETWORK_MARKERS = (
     "readerror",
     "writeerror",
     "ssl",
+    "client has been closed",
+    "has been closed",
+    "cannot send a request",
 )
 
 
@@ -285,10 +288,12 @@ def _execute(
     build_fn=None,
 ):
     """
-    Run a PostgREST builder; retry transient network errors with backoff.
+    Run a PostgREST request; retry transient network errors with backoff.
 
-    Prefer build_fn=lambda client: client.table(...).insert(...) so each retry
-    uses a fresh Supabase client after ConnectionTerminated / HTTP/2 drops.
+    Prefer build_fn so each retry uses a fresh Supabase client after
+    ConnectionTerminated / "client has been closed". If only a prebuilt
+    builder is passed, retries will not close that client mid-flight
+    (closing it would poison the builder).
     """
     if builder is None and build_fn is None:
         raise ValueError("builder or build_fn is required")
@@ -321,6 +326,8 @@ def _execute(
                     "name or service not known",
                     "temporarily unavailable",
                     "failed to establish",
+                    "client has been closed",
+                    "cannot send a request",
                 )
             )
             if transient and attempt < _SUPABASE_MAX_RETRIES:
@@ -330,9 +337,12 @@ def _execute(
                     f"operation={operation} table={table} "
                     f"attempt={attempt + 1} max_attempts={attempts} "
                     f"retry_delay_seconds={delay} "
+                    f"rebuild={str(build_fn is not None).lower()} "
                     f"error={msg}"
                 )
-                reset_supabase_client()
+                # Only close/reset when we can rebuild against a new client.
+                if build_fn is not None:
+                    reset_supabase_client()
                 if delay > 0:
                     time.sleep(delay)
                 continue
@@ -436,21 +446,26 @@ def update_scraper_run_counts(run_id: str, **counts) -> dict:
     payload = {k: v for k, v in counts.items() if k in allowed and v is not None}
     if not payload:
         return get_scraper_run(run_id)
-    client = get_supabase_client()
+
+    def build_fn(client):
+        return client.table("scraper_runs").update(payload).eq("id", run_id).select("*")
+
     response = _execute(
         "update_scraper_run_counts",
         "scraper_runs",
-        client.table("scraper_runs").update(payload).eq("id", run_id).select("*"),
+        build_fn=build_fn,
     )
     return _one(response)
 
 
 def get_scraper_run(run_id: str) -> dict:
-    client = get_supabase_client()
+    def build_fn(client):
+        return client.table("scraper_runs").select("*").eq("id", run_id).limit(1)
+
     response = _execute(
         "get_scraper_run",
         "scraper_runs",
-        client.table("scraper_runs").select("*").eq("id", run_id).limit(1),
+        build_fn=build_fn,
     )
     return _one(response)
 
@@ -486,25 +501,29 @@ def mark_stale_running_runs(
     older_than_hours: int = 6,
 ) -> int:
     """Best-effort: mark abandoned RUNNING rows as FAILED."""
-    client = get_supabase_client()
     cutoff = _iso(_utc_now() - timedelta(hours=max(older_than_hours, 1)))
+    update_payload = {
+        "status": "FAILED",
+        "completed_at": _iso(),
+        "failure_code": "STALE_RUNNING",
+        "failure_reason": "Run left in RUNNING past threshold",
+    }
+
+    def build_fn(client):
+        return (
+            client.table("scraper_runs")
+            .update(update_payload)
+            .eq("platform", platform)
+            .eq("status", "RUNNING")
+            .lt("started_at", cutoff)
+            .select("id")
+        )
+
     response = _execute(
         "mark_stale_running_runs",
         "scraper_runs",
-        client.table("scraper_runs")
-        .update(
-            {
-                "status": "FAILED",
-                "completed_at": _iso(),
-                "failure_code": "STALE_RUNNING",
-                "failure_reason": "Run left in RUNNING past threshold",
-            }
-        )
-        .eq("platform", platform)
-        .eq("status", "RUNNING")
-        .lt("started_at", cutoff)
-        .select("id"),
         platform=platform,
+        build_fn=build_fn,
     )
     return len(_rows(response))
 
@@ -520,24 +539,31 @@ def get_latest_project_occurrence(platform: str, project_id: str) -> Optional[di
     """
     if not platform or not project_id:
         raise ValueError("platform and project_id are required")
-    client = get_supabase_client()
+
+    select_cols = (
+        "id,scraped_at,email_status,email_sent,email_eligible,email_not_sent_reason,"
+        "title,source_url,detail_extraction_status,description,location_preference,"
+        "project_length,start_date_text,level_of_support,industry,contracting_process,"
+        "short_description,budget_text,platform_category"
+    )
+
+    def build_fn(client):
+        return (
+            client.table("projects")
+            .select(select_cols)
+            .eq("platform", platform)
+            .eq("project_id", project_id)
+            .order("scraped_at", desc=True)
+            .limit(1)
+        )
+
     # Include detail fields so existing-row enrichment can skip already-complete rows
     response = _execute(
         "get_latest_project_occurrence",
         "projects",
-        client.table("projects")
-        .select(
-            "id,scraped_at,email_status,email_sent,email_eligible,email_not_sent_reason,"
-            "title,source_url,detail_extraction_status,description,location_preference,"
-            "project_length,start_date_text,level_of_support,industry,contracting_process,"
-            "short_description,budget_text,platform_category"
-        )
-        .eq("platform", platform)
-        .eq("project_id", project_id)
-        .order("scraped_at", desc=True)
-        .limit(1),
         platform=platform,
         project_id=project_id,
+        build_fn=build_fn,
     )
     return _one(response, required=False)
 
@@ -585,15 +611,20 @@ def should_process_project(
 
 def platform_has_projects(platform: str) -> bool:
     """Platform-specific cold-start detection. Raises on DB failure."""
-    client = get_supabase_client()
+
+    def build_fn(client):
+        return (
+            client.table("projects")
+            .select("id")
+            .eq("platform", platform)
+            .limit(1)
+        )
+
     response = _execute(
         "platform_has_projects",
         "projects",
-        client.table("projects")
-        .select("id")
-        .eq("platform", platform)
-        .limit(1),
         platform=platform,
+        build_fn=build_fn,
     )
     return bool(_rows(response))
 
@@ -931,13 +962,17 @@ def detail_enrichment_schema_ready() -> bool:
     if _detail_enrichment_schema_ready is not None:
         return _detail_enrichment_schema_ready
     try:
-        client = get_supabase_client()
+        def build_fn(client):
+            return (
+                client.table("projects")
+                .select("billing_type,detail_attempt_count,budget_source")
+                .limit(1)
+            )
+
         _execute(
             "probe_detail_enrichment_columns",
             "projects",
-            client.table("projects")
-            .select("billing_type,detail_attempt_count,budget_source")
-            .limit(1),
+            build_fn=build_fn,
         )
         _detail_enrichment_schema_ready = True
     except Exception as exc:
@@ -1095,11 +1130,13 @@ def update_project_details(project_row_id: str, detail_updates: dict) -> dict:
     payload = _strip_unavailable_enrichment_columns(payload)
     warn_detail_enrichment_migration_once()
 
-    client = get_supabase_client()
+    def build_fn(client):
+        return client.table("projects").update(payload).eq("id", project_row_id).select("*")
+
     response = _execute(
         "update_project_details",
         "projects",
-        client.table("projects").update(payload).eq("id", project_row_id).select("*"),
+        build_fn=build_fn,
     )
     return _one(response)
 
@@ -1115,22 +1152,25 @@ def get_projects_needing_detail_enrichment(
     Fetch Catalant rows that need detail enrichment.
     Uses broad select + local filter because PostgREST OR emptiness checks are awkward.
     """
-    client = get_supabase_client()
-    query = (
-        client.table("projects")
-        .select("*")
-        .eq("platform", platform)
-        .order("scraped_at", desc=True)
-        .limit(max(limit * 5, 50))
-    )
-    if project_id:
-        query = query.eq("project_id", project_id)
+
+    def build_fn(client):
+        query = (
+            client.table("projects")
+            .select("*")
+            .eq("platform", platform)
+            .order("scraped_at", desc=True)
+            .limit(max(limit * 5, 50))
+        )
+        if project_id:
+            query = query.eq("project_id", project_id)
+        return query
+
     response = _execute(
         "get_projects_needing_detail_enrichment",
         "projects",
-        query,
         platform=platform,
         project_id=project_id or "",
+        build_fn=build_fn,
     )
     rows = _rows(response)
     selected = []
@@ -1177,23 +1217,28 @@ def insert_project_occurrence(
         email_sent=email_sent,
         email_not_sent_reason=email_not_sent_reason,
     )
-    client = get_supabase_client()
+
+    def build_fn(client):
+        return client.table("projects").insert(payload).select("*")
+
     response = _execute(
         "insert_project_occurrence",
         "projects",
-        client.table("projects").insert(payload).select("*"),
         platform=payload.get("platform", ""),
         project_id=payload.get("project_id", ""),
+        build_fn=build_fn,
     )
     return _one(response)
 
 
 def get_project_by_id(row_id: str) -> Optional[dict]:
-    client = get_supabase_client()
+    def build_fn(client):
+        return client.table("projects").select("*").eq("id", row_id).limit(1)
+
     response = _execute(
         "get_project_by_id",
         "projects",
-        client.table("projects").select("*").eq("id", row_id).limit(1),
+        build_fn=build_fn,
     )
     return _one(response, required=False)
 
@@ -1218,11 +1263,14 @@ def update_project_email_status(row_id: str, **fields) -> dict:
     payload = {k: v for k, v in fields.items() if k in allowed}
     if "email_last_error" in payload and payload["email_last_error"] is not None:
         payload["email_last_error"] = redact_db_error(payload["email_last_error"])[:2000]
-    client = get_supabase_client()
+
+    def build_fn(client):
+        return client.table("projects").update(payload).eq("id", row_id).select("*")
+
     response = _execute(
         "update_project_email_status",
         "projects",
-        client.table("projects").update(payload).eq("id", row_id).select("*"),
+        build_fn=build_fn,
     )
     return _one(response)
 
@@ -1234,21 +1282,29 @@ def get_retryable_email_projects(
     limit: int = 20,
     platform: Optional[str] = None,
 ) -> list:
-    client = get_supabase_client()
     current = _iso(now or _utc_now())
-    query = (
-        client.table("projects")
-        .select("*")
-        .eq("email_status", "RETRY_PENDING")
-        .lte("email_next_retry_at", current)
-        .lt("email_attempt_count", max_attempts)
-        .eq("email_eligible", True)
-        .order("email_next_retry_at", desc=False)
-        .limit(limit)
+
+    def build_fn(client):
+        query = (
+            client.table("projects")
+            .select("*")
+            .eq("email_status", "RETRY_PENDING")
+            .lte("email_next_retry_at", current)
+            .lt("email_attempt_count", max_attempts)
+            .eq("email_eligible", True)
+            .order("email_next_retry_at", desc=False)
+            .limit(limit)
+        )
+        if platform:
+            query = query.eq("platform", platform)
+        return query
+
+    response = _execute(
+        "get_retryable_email_projects",
+        "projects",
+        platform=platform or "",
+        build_fn=build_fn,
     )
-    if platform:
-        query = query.eq("platform", platform)
-    response = _execute("get_retryable_email_projects", "projects", query)
     return _rows(response)
 
 
@@ -1265,7 +1321,6 @@ def record_email_attempt(
     metadata: Optional[dict] = None,
     attempt_id: Optional[str] = None,
 ) -> dict:
-    client = get_supabase_client()
     if attempt_id:
         payload = {
             "status": status,
@@ -1276,13 +1331,19 @@ def record_email_attempt(
         }
         if metadata is not None:
             payload["metadata"] = metadata
+
+        def build_fn(client):
+            return (
+                client.table("email_attempts")
+                .update(payload)
+                .eq("id", attempt_id)
+                .select("*")
+            )
+
         response = _execute(
             "update_email_attempt",
             "email_attempts",
-            client.table("email_attempts")
-            .update(payload)
-            .eq("id", attempt_id)
-            .select("*"),
+            build_fn=build_fn,
         )
         return _one(response)
 
@@ -1300,10 +1361,14 @@ def record_email_attempt(
     }
     if status in ("SENT", "FAILED"):
         payload["completed_at"] = _iso()
+
+    def build_fn(client):
+        return client.table("email_attempts").insert(payload).select("*")
+
     response = _execute(
         "record_email_attempt",
         "email_attempts",
-        client.table("email_attempts").insert(payload).select("*"),
+        build_fn=build_fn,
     )
     return _one(response)
 
@@ -1372,34 +1437,50 @@ def save_scraper_session(
         "session_version": 1,
         "metadata": metadata or {"cookie_count": len(safe_cookies)},
     }
-    client = get_supabase_client()
+
+    def build_fn(client):
+        return (
+            client.table("scraper_sessions")
+            .upsert(payload, on_conflict="platform")
+            .select("*")
+        )
+
     response = _execute(
         "save_scraper_session",
         "scraper_sessions",
-        client.table("scraper_sessions").upsert(payload, on_conflict="platform").select("*"),
         platform=platform,
+        build_fn=build_fn,
     )
     return _one(response)
 
 
 def load_scraper_session(platform: str) -> Optional[dict]:
-    client = get_supabase_client()
+    def build_fn(client):
+        return (
+            client.table("scraper_sessions")
+            .select("*")
+            .eq("platform", platform)
+            .limit(1)
+        )
+
     response = _execute(
         "load_scraper_session",
         "scraper_sessions",
-        client.table("scraper_sessions").select("*").eq("platform", platform).limit(1),
         platform=platform,
+        build_fn=build_fn,
     )
     return _one(response, required=False)
 
 
 def delete_scraper_session(platform: str) -> bool:
-    client = get_supabase_client()
+    def build_fn(client):
+        return client.table("scraper_sessions").delete().eq("platform", platform)
+
     _execute(
         "delete_scraper_session",
         "scraper_sessions",
-        client.table("scraper_sessions").delete().eq("platform", platform),
         platform=platform,
+        build_fn=build_fn,
     )
     return True
 
@@ -1425,15 +1506,17 @@ def list_required_tables() -> list[str]:
 
 def ensure_schema_ready() -> None:
     """Raise a clear error if required tables are missing."""
-    client = get_supabase_client()
     for table in list_required_tables():
+        col = "platform" if table == "scraper_sessions" else "id"
+
+        def build_fn(client, _table=table, _col=col):
+            return client.table(_table).select(_col).limit(1)
+
         try:
             _execute(
                 "ensure_schema",
                 table,
-                client.table(table)
-                .select("id" if table != "scraper_sessions" else "platform")
-                .limit(1),
+                build_fn=build_fn,
             )
         except Exception as exc:
             if is_missing_schema_error(exc):
@@ -1448,16 +1531,18 @@ def test_supabase_connection(cleanup: bool = True) -> dict:
     Validate credentials and tables with a reversible temporary insert.
     Never prints keys. Returns a summary dict.
     """
-    client = get_supabase_client()
     availability = {}
     for table in list_required_tables():
+        col = "platform" if table == "scraper_sessions" else "id"
+
+        def build_fn(client, _table=table, _col=col):
+            return client.table(_table).select(_col).limit(1)
+
         try:
             _execute(
                 "test_table",
                 table,
-                client.table(table).select(
-                    "id" if table != "scraper_sessions" else "platform"
-                ).limit(1),
+                build_fn=build_fn,
             )
             availability[table] = True
         except Exception as exc:
@@ -1494,15 +1579,24 @@ def test_supabase_connection(cleanup: bool = True) -> dict:
     finally:
         if cleanup:
             if project and project.get("id"):
+                project_id = project["id"]
+
+                def build_delete_project(client, _pid=project_id):
+                    return client.table("projects").delete().eq("id", _pid)
+
                 _execute(
                     "cleanup_test_project",
                     "projects",
-                    client.table("projects").delete().eq("id", project["id"]),
+                    build_fn=build_delete_project,
                 )
+
+            def build_delete_run(client, _rid=run_id):
+                return client.table("scraper_runs").delete().eq("id", _rid)
+
             _execute(
                 "cleanup_test_run",
                 "scraper_runs",
-                client.table("scraper_runs").delete().eq("id", run_id),
+                build_fn=build_delete_run,
             )
 
     return {
