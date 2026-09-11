@@ -2160,11 +2160,25 @@ def run_monitoring_cycle_with_browser_recovery(
         except KeyboardInterrupt:
             raise
         except Exception as exc:
-            # Retry any cycle/scan/browser error (not only tab crashes).
+            # Retry any cycle/scan/browser/DB error (not only tab crashes).
             last_crash = exc
             sanitized = redact_sensitive_text(exc)
             crash = is_recoverable_browser_crash(exc)
             exhaustion = browser_process.is_browser_process_exhaustion(exc)
+            lowered = sanitized.lower()
+            db_network = isinstance(exc, db.SupabaseNetworkError) or (
+                "connectionterminated" in lowered
+                or "remoteprotocolerror" in lowered
+                or (
+                    "operation=" in lowered
+                    and "connection" in lowered
+                    and (
+                        "scraper_runs" in lowered
+                        or "projects" in lowered
+                        or "supabase" in lowered
+                    )
+                )
+            )
             print(
                 "event=cycle_error_detected "
                 "operation=monitoring_cycle "
@@ -2174,6 +2188,7 @@ def run_monitoring_cycle_with_browser_recovery(
                 f"retry_delay_seconds={delay_seconds} "
                 f"browser_crash={str(crash).lower()} "
                 f"process_exhaustion={str(exhaustion).lower()} "
+                f"supabase_network={str(db_network).lower()} "
                 f"error={sanitized}"
             )
             if attempt >= max_retries:
@@ -2193,11 +2208,30 @@ def run_monitoring_cycle_with_browser_recovery(
                 f"retry_delay_seconds={delay_seconds}"
             )
             previous_monitor_state = _monitor_state
-            _monitor_state = "browser_recovery"
+            _monitor_state = "supabase_recovery" if db_network else "browser_recovery"
             try:
                 _sleep_interruptible(delay_seconds)
             finally:
                 _monitor_state = previous_monitor_state
+
+            if db_network:
+                # DB blip: reset Supabase HTTP client; keep the live Chrome session.
+                try:
+                    db.reset_supabase_client()
+                except Exception:
+                    pass
+                print(
+                    "event=cycle_recovery_supabase_reset "
+                    "operation=monitoring_cycle "
+                    "driver_recreated=false"
+                )
+                print(
+                    "event=cycle_recovery_retry_start "
+                    "operation=monitoring_cycle "
+                    f"check_number={check_number} "
+                    f"recovery_attempt={attempt + 1}"
+                )
+                continue
 
             if exhaustion:
                 try:

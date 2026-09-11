@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import re
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
@@ -18,6 +19,29 @@ load_dotenv()
 PLATFORM_CATALANT = "catalant"
 SCRAPER_NAME = "catalant-monitor"
 SCRAPER_VERSION = "2.0.0"
+
+# Transient PostgREST/httpx failures (e.g. HTTP/2 ConnectionTerminated).
+_SUPABASE_MAX_RETRIES = max(0, int(os.getenv("SUPABASE_MAX_RETRIES", "3")))
+_SUPABASE_RETRY_BASE_SECONDS = max(0.0, float(os.getenv("SUPABASE_RETRY_BASE_SECONDS", "1")))
+_TRANSIENT_NETWORK_MARKERS = (
+    "timeout",
+    "timed out",
+    "connection",
+    "network",
+    "connectionterminated",
+    "remoteprotocolerror",
+    "name or service not known",
+    "temporarily unavailable",
+    "failed to establish",
+    "server disconnected",
+    "connection reset",
+    "broken pipe",
+    "goaway",
+    "stream_id",
+    "readerror",
+    "writeerror",
+    "ssl",
+)
 
 
 def get_occurrence_window_days() -> int:
@@ -187,9 +211,24 @@ def get_supabase_credentials() -> tuple[str, str, str]:
 
 
 def reset_supabase_client() -> None:
-    """Clear the cached client (tests only)."""
+    """Drop the cached client so the next call opens a fresh HTTP session."""
     global _supabase_client
+    old = _supabase_client
     _supabase_client = None
+    if old is None:
+        return
+    try:
+        # Best-effort close of underlying httpx clients (supabase-py variants differ).
+        for attr in ("postgrest", "auth", "storage", "functions"):
+            svc = getattr(old, attr, None)
+            session = getattr(svc, "session", None) if svc is not None else None
+            if session is not None and hasattr(session, "close"):
+                try:
+                    session.close()
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
 
 def get_supabase_client():
@@ -223,39 +262,100 @@ def get_supabase_client():
     return _supabase_client
 
 
-def _execute(operation: str, table: str, builder, platform: str = "", project_id: str = ""):
-    """Run a PostgREST builder and normalize errors."""
-    try:
-        response = builder.execute()
-    except SupabaseConfigError:
-        raise
-    except Exception as exc:
-        msg = redact_db_error(exc)
-        lowered = msg.lower()
-        context = (
-            f"operation={operation} table={table} "
-            f"platform={platform or '-'} project_id={project_id or '-'}: {msg}"
-        )
-        if any(
-            tok in lowered
-            for tok in (
-                "timeout",
-                "timed out",
-                "connection",
-                "network",
-                "name or service not known",
-                "temporarily unavailable",
-                "failed to establish",
-            )
-        ):
-            raise SupabaseNetworkError(context) from exc
-        raise SupabaseAPIError(context) from exc
+def is_transient_supabase_network_error(exc: BaseException) -> bool:
+    """True for retryable transport failures (timeouts, ConnectionTerminated, etc.)."""
+    parts = [str(exc or "")]
+    cause = getattr(exc, "__cause__", None)
+    if cause is not None:
+        parts.append(str(cause))
+    ctx = getattr(exc, "__context__", None)
+    if ctx is not None and ctx is not cause:
+        parts.append(str(ctx))
+    message = " ".join(parts).lower()
+    return any(marker in message for marker in _TRANSIENT_NETWORK_MARKERS)
 
-    if response is None:
-        raise SupabaseAPIError(
-            f"operation={operation} table={table}: empty response"
-        )
-    return response
+
+def _execute(
+    operation: str,
+    table: str,
+    builder=None,
+    platform: str = "",
+    project_id: str = "",
+    *,
+    build_fn=None,
+):
+    """
+    Run a PostgREST builder; retry transient network errors with backoff.
+
+    Prefer build_fn=lambda client: client.table(...).insert(...) so each retry
+    uses a fresh Supabase client after ConnectionTerminated / HTTP/2 drops.
+    """
+    if builder is None and build_fn is None:
+        raise ValueError("builder or build_fn is required")
+
+    last_exc: Optional[BaseException] = None
+    attempts = _SUPABASE_MAX_RETRIES + 1
+
+    for attempt in range(attempts):
+        try:
+            if build_fn is not None:
+                builder = build_fn(get_supabase_client())
+            response = builder.execute()
+        except SupabaseConfigError:
+            raise
+        except Exception as exc:
+            last_exc = exc
+            msg = redact_db_error(exc)
+            lowered = msg.lower()
+            context = (
+                f"operation={operation} table={table} "
+                f"platform={platform or '-'} project_id={project_id or '-'}: {msg}"
+            )
+            transient = is_transient_supabase_network_error(exc) or any(
+                tok in lowered
+                for tok in (
+                    "timeout",
+                    "timed out",
+                    "connection",
+                    "network",
+                    "name or service not known",
+                    "temporarily unavailable",
+                    "failed to establish",
+                )
+            )
+            if transient and attempt < _SUPABASE_MAX_RETRIES:
+                delay = _SUPABASE_RETRY_BASE_SECONDS * (2**attempt)
+                print(
+                    "event=supabase_network_retry "
+                    f"operation={operation} table={table} "
+                    f"attempt={attempt + 1} max_attempts={attempts} "
+                    f"retry_delay_seconds={delay} "
+                    f"error={msg}"
+                )
+                reset_supabase_client()
+                if delay > 0:
+                    time.sleep(delay)
+                continue
+
+            if transient:
+                reset_supabase_client()
+                raise SupabaseNetworkError(context) from exc
+            raise SupabaseAPIError(context) from exc
+
+        if response is None:
+            raise SupabaseAPIError(
+                f"operation={operation} table={table}: empty response"
+            )
+        if attempt > 0:
+            print(
+                "event=supabase_network_retry_success "
+                f"operation={operation} table={table} attempt={attempt + 1}"
+            )
+        return response
+
+    raise SupabaseNetworkError(
+        f"operation={operation} table={table}: exhausted retries ({last_exc})"
+    )
 
 
 def _rows(response) -> list:
@@ -291,7 +391,6 @@ def create_scraper_run(
     scraper_version: str = SCRAPER_VERSION,
     metadata: Optional[dict] = None,
 ) -> dict:
-    client = get_supabase_client()
     payload = {
         "platform": platform,
         "scraper_name": scraper_name,
@@ -300,11 +399,15 @@ def create_scraper_run(
         "started_at": _iso(),
         "metadata": metadata or {},
     }
+
+    def build_fn(client):
+        return client.table("scraper_runs").insert(payload).select("*")
+
     response = _execute(
         "create_scraper_run",
         "scraper_runs",
-        client.table("scraper_runs").insert(payload).select("*"),
         platform=platform,
+        build_fn=build_fn,
     )
     return _one(response)
 
