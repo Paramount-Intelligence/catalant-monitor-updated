@@ -156,6 +156,12 @@ Add these secrets (copy values from your `.env` file):
 
 ## Troubleshooting
 
+**High Railway memory between checks:**
+
+- Default keeps Chromium running during `CHECK_INTERVAL` sleep.
+- Set `QUIT_BROWSER_BETWEEN_CHECKS=true` to quit Chrome after each check (cookies restored on next wake). Idle RAM should drop well under ~1 GB average.
+- Rollback: `QUIT_BROWSER_BETWEEN_CHECKS=false`.
+
 **No projects found:**
 
 - Check if you're logged in correctly

@@ -92,6 +92,11 @@ class Config:
         os.getenv("SUPPRESS_PROJECT_EMAILS_ON_FIRST_SCAN", "false").lower() == "true"
     )
     PROCESS_RECYCLE_HOURS = float(os.getenv("PROCESS_RECYCLE_HOURS", "3"))
+    # false = keep Chrome warm across CHECK_INTERVAL (legacy). true = quit between
+    # checks to cut idle RAM; next cycle restores cookies via setup_session.
+    QUIT_BROWSER_BETWEEN_CHECKS = (
+        os.getenv("QUIT_BROWSER_BETWEEN_CHECKS", "false").lower() == "true"
+    )
     # 0 = unlimited (no storm caps). Kept for ops compatibility with sibling scrapers.
     INCIDENT_CONSECUTIVE_FAILURE_THRESHOLD = int(
         os.getenv("INCIDENT_CONSECUTIVE_FAILURE_THRESHOLD", "1")
@@ -559,6 +564,7 @@ def print_startup_banner():
     print(f"Error cooldown: {Config.ERROR_EMAIL_COOLDOWN_MINUTES} minutes")
     print(f"Suppress emails on first scan: {Config.SUPPRESS_PROJECT_EMAILS_ON_FIRST_SCAN}")
     print(f"Process recycle hours: {Config.PROCESS_RECYCLE_HOURS}")
+    print(f"Quit browser between checks: {Config.QUIT_BROWSER_BETWEEN_CHECKS}")
     print(f"Headless: {Config.HEADLESS}")
     print("=" * 50)
     ok, missing = validate_error_email_configuration()
@@ -2115,6 +2121,40 @@ def recreate_authenticated_driver(old_driver=None):
     return driver, session
 
 
+def stop_browser_before_sleep(driver):
+    """Quit Chromium before CHECK_INTERVAL so idle RAM drops. Returns None."""
+    started = time.time()
+    print("event=browser_stop_before_sleep operation=monitoring_loop")
+    safe_quit_driver(driver)
+    elapsed = time.time() - started
+    print(
+        "event=browser_stop_before_sleep_complete "
+        "operation=monitoring_loop "
+        f"elapsed_seconds={elapsed:.1f}"
+    )
+    return None
+
+
+def start_browser_after_sleep():
+    """
+    Fresh Chrome + existing cookie/session restore after idle sleep.
+    Returns (driver, session_result). Caller handles failed session.
+    """
+    started = time.time()
+    print("event=browser_start_after_sleep operation=monitoring_loop")
+    driver = initialize_driver()
+    session = setup_session(driver)
+    elapsed = time.time() - started
+    print(
+        "event=browser_start_after_sleep_complete "
+        "operation=monitoring_loop "
+        f"elapsed_seconds={elapsed:.1f} "
+        f"success={str(bool(session.get('success'))).lower()} "
+        f"method={session.get('message') or session.get('classification') or 'session'}"
+    )
+    return driver, session
+
+
 def run_monitoring_cycle_with_browser_recovery(
     driver,
     *,
@@ -2859,6 +2899,26 @@ def main(run_once=False, dry_run=False, debug_extraction=False):
         check_count = 0
         while True:
             try:
+                if driver is None:
+                    driver, session = start_browser_after_sleep()
+                    if not session.get("success"):
+                        print("❌ Failed to restore session after sleep")
+                        if not session.get("alert_sent") and not _last_login_alert.get("alert_sent"):
+                            send_error_notification(
+                                "SESSION_SETUP:FAILED",
+                                RuntimeError(session.get("message") or "Failed to restore session"),
+                                details=f"classification={session.get('classification')}",
+                                diagnostics={
+                                    **_safe_driver_info(driver),
+                                    "operation": "browser_start_after_sleep",
+                                },
+                            )
+                        safe_quit_driver(driver)
+                        driver = None
+                        print(f"\n⏳ Next check in {Config.CHECK_INTERVAL} seconds...")
+                        time.sleep(Config.CHECK_INTERVAL)
+                        continue
+
                 check_count += 1
                 _monitor_check_count = check_count
                 if check_count % 20 == 0:
@@ -2882,6 +2942,9 @@ def main(run_once=False, dry_run=False, debug_extraction=False):
                 if run_once or dry_run:
                     print("✅ Run-once / dry-run complete")
                     break
+
+                if Config.QUIT_BROWSER_BETWEEN_CHECKS:
+                    driver = stop_browser_before_sleep(driver)
 
                 if browser_process.should_recycle_process():
                     browser_process.recycle_and_exit(
@@ -2933,7 +2996,11 @@ def main(run_once=False, dry_run=False, debug_extraction=False):
                     break
                 safe_quit_driver(driver)
                 driver = None
+                print(f"\n⏳ Next check in {Config.CHECK_INTERVAL} seconds...")
                 time.sleep(Config.CHECK_INTERVAL)
+                if Config.QUIT_BROWSER_BETWEEN_CHECKS:
+                    # Leave driver=None; next loop iteration cold-starts after sleep.
+                    continue
                 try:
                     driver = initialize_driver()
                     session = setup_session(driver)
@@ -2945,6 +3012,8 @@ def main(run_once=False, dry_run=False, debug_extraction=False):
                                 RuntimeError(session.get("message") or "Re-login failed"),
                                 diagnostics={"operation": "browser_recovery"},
                             )
+                        safe_quit_driver(driver)
+                        driver = None
                 except Exception as recovery_err:
                     print(f"⚠️ Recovery failed: {redact_sensitive_text(recovery_err)}")
                     send_error_notification(
@@ -2953,6 +3022,7 @@ def main(run_once=False, dry_run=False, debug_extraction=False):
                         traceback_text=traceback.format_exc(),
                         diagnostics={"operation": "browser_recovery"},
                     )
+                    driver = None
 
     except KeyboardInterrupt:
         print("\n\n⏹️ Stopped by user")
