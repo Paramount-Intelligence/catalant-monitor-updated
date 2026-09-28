@@ -7,6 +7,12 @@
 # Session files (cookies only)
 catalant_cookies.json
 
+# Local inspect screenshots / dumps
+_inspect_*.png
+_inspect_*.json
+*_inspect_*.png
+*_inspect_*.json
+
 # Python
 __pycache__/
 *.py[cod]
@@ -56,8 +62,6 @@ script_clean.backup.py
 
 # Local evidence / debug dumps
 catalant-evidence/
-*_inspect_*.png
-*_inspect_*.json
 
 # Supabase CLI local artifacts
 supabase/.temp/

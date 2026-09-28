@@ -1389,24 +1389,55 @@ def compute_email_next_retry_at(
 # Sessions
 # ---------------------------------------------------------------------------
 
-def _earliest_cookie_expiry(cookies: list) -> Optional[str]:
-    expiries = []
-    for cookie in cookies or []:
-        if not isinstance(cookie, dict):
-            continue
-        exp = cookie.get("expiry") or cookie.get("expires")
-        if exp is None:
-            continue
-        try:
-            ts = float(exp)
-            if ts > 1e12:
-                ts = ts / 1000.0
-            expiries.append(datetime.fromtimestamp(ts, tz=timezone.utc))
-        except (TypeError, ValueError, OSError):
-            continue
-    if not expiries:
+def _cookie_expiry_datetime(cookie: dict) -> Optional[datetime]:
+    if not isinstance(cookie, dict):
         return None
-    return _iso(min(expiries))
+    exp = cookie.get("expiry") if cookie.get("expiry") is not None else cookie.get("expires")
+    if exp is None or exp == "":
+        return None
+    try:
+        ts = float(exp)
+        if ts > 1e12:
+            ts = ts / 1000.0
+        return datetime.fromtimestamp(ts, tz=timezone.utc)
+    except (TypeError, ValueError, OSError, OverflowError):
+        return None
+
+
+def _session_cookie(cookies: list) -> Optional[dict]:
+    named = [c for c in (cookies or []) if isinstance(c, dict) and (c.get("name") or "")]
+    for cookie in named:
+        if cookie.get("name") == "session":
+            return cookie
+    for cookie in named:
+        if str(cookie.get("name") or "").lower() == "session":
+            return cookie
+    return None
+
+
+def _session_cookie_expiry(cookies: list) -> Optional[str]:
+    """Expiry of the `session` cookie only — not the earliest-expiring tracker cookie."""
+    cookie = _session_cookie(cookies)
+    if cookie is None:
+        return None
+    dt = _cookie_expiry_datetime(cookie)
+    if dt is None:
+        return None
+    return _iso(dt)
+
+
+def _warn_if_session_expiry_soon(expires_at: Optional[str], *, now: Optional[datetime] = None) -> None:
+    parsed = _parse_timestamptz(expires_at) if expires_at else None
+    if parsed is None:
+        return
+    current = now or _utc_now()
+    remaining_hours = (parsed - current).total_seconds() / 3600.0
+    if remaining_hours < 12:
+        print(
+            "⚠️ session cookie expiry warning: "
+            f"expires_at={expires_at} remaining_hours={remaining_hours:.1f} "
+            "(threshold=12)"
+        )
 
 
 def save_scraper_session(
@@ -1433,10 +1464,11 @@ def save_scraper_session(
         "platform": platform,
         "session_data": {"cookies": safe_cookies},
         "saved_at": _iso(),
-        "expires_at": _earliest_cookie_expiry(safe_cookies),
+        "expires_at": _session_cookie_expiry(safe_cookies),
         "session_version": 1,
         "metadata": metadata or {"cookie_count": len(safe_cookies)},
     }
+    _warn_if_session_expiry_soon(payload["expires_at"])
 
     def build_fn(client):
         return (
