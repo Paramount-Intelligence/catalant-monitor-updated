@@ -487,6 +487,50 @@ class SessionTests(unittest.TestCase):
         loaded = db.load_scraper_session("catalant")
         self.assertEqual(loaded["session_data"]["cookies"][0]["name"], "sid")
 
+    def test_expires_at_uses_session_cookie_not_earliest(self):
+        now = datetime(2026, 9, 28, 12, 0, tzinfo=timezone.utc)
+        tracker_ts = int((now + timedelta(hours=1)).timestamp())
+        session_ts = int((now + timedelta(hours=72)).timestamp())
+        cookies = [
+            {"name": "_gat", "value": "x", "expiry": tracker_ts},
+            {"name": "session", "value": "tok", "expiry": session_ts},
+        ]
+        with mock.patch.object(db, "_utc_now", return_value=now), mock.patch("builtins.print"):
+            saved = db.save_scraper_session("catalant", cookies)
+        parsed = db._parse_timestamptz(saved["expires_at"])
+        self.assertIsNotNone(parsed)
+        self.assertEqual(int(parsed.timestamp()), session_ts)
+        self.assertNotEqual(int(parsed.timestamp()), tracker_ts)
+
+    def test_warns_when_session_cookie_under_12_hours(self):
+        now = datetime(2026, 9, 28, 12, 0, tzinfo=timezone.utc)
+        session_ts = int((now + timedelta(hours=6)).timestamp())
+        prints = []
+
+        def capture(*args, **_kwargs):
+            prints.append(" ".join(str(a) for a in args))
+
+        with mock.patch.object(db, "_utc_now", return_value=now), mock.patch(
+            "builtins.print", side_effect=capture
+        ):
+            db.save_scraper_session(
+                "catalant",
+                [{"name": "session", "value": "tok", "expiry": session_ts}],
+            )
+        joined = "\n".join(prints)
+        self.assertIn("session cookie expiry warning", joined)
+        self.assertIn("threshold=12", joined)
+
+    def test_no_session_cookie_leaves_expires_at_none(self):
+        now = datetime(2026, 9, 28, 12, 0, tzinfo=timezone.utc)
+        tracker_ts = int((now + timedelta(hours=1)).timestamp())
+        with mock.patch.object(db, "_utc_now", return_value=now), mock.patch("builtins.print"):
+            saved = db.save_scraper_session(
+                "catalant",
+                [{"name": "_gat", "value": "x", "expiry": tracker_ts}],
+            )
+        self.assertIsNone(saved.get("expires_at"))
+
     def test_local_cookie_fallback_file(self):
         import json
 

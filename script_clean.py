@@ -18,6 +18,7 @@ from email.message import EmailMessage
 if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8')
 from datetime import datetime, timezone, timedelta
+from urllib.parse import urlparse
 
 PKT = timezone(timedelta(hours=5))  # Pakistan Standard Time (UTC+5)
 from email.mime.text import MIMEText
@@ -621,49 +622,200 @@ def save_login_failure_evidence(driver, diagnostics=None, prefix="catalant_login
     return out
 
 
-def classify_login_failure(driver, exc=None):
-    """Best-effort classification of Catalant login failure."""
-    text = ""
+def _contains_whole_phrase(haystack, phrase):
+    """True if phrase appears in haystack as a whole word/phrase (not a substring)."""
+    if not haystack or not phrase:
+        return False
+    pattern = r"(?<![A-Za-z0-9])" + re.escape(phrase) + r"(?![A-Za-z0-9])"
+    return re.search(pattern, haystack, re.IGNORECASE) is not None
+
+
+def _any_whole_phrase(haystack, phrases):
+    return any(_contains_whole_phrase(haystack, p) for p in phrases)
+
+
+def _login_page_url_title_text(driver):
+    """URL, title, and visible body text only. Never includes exception text."""
     url = ""
     title = ""
     if driver:
         try:
-            url = (driver.current_url or "").lower()
+            url = driver.current_url or ""
         except Exception:
             pass
         try:
-            title = (driver.title or "").lower()
+            title = driver.title or ""
         except Exception:
             pass
-        text = (_safe_page_text(driver, 4000) or "").lower()
-    blob = f"{text} {url} {title} {str(exc or '').lower()}"
-    if isinstance(exc, TimeoutException) or "timeout" in blob:
-        # Prefer more specific page signals when present
-        pass
-    if any(w in blob for w in ("captcha", "recaptcha", "hcaptcha", "verify you are human")):
+    text = _safe_page_text(driver, 4000) or ""
+    return url, title, text
+
+
+def _url_path(url):
+    try:
+        return (urlparse(url or "").path or "").lower()
+    except Exception:
+        return ""
+
+
+def _is_logged_in_url(url):
+    path = _url_path(url)
+    if "/auth/" in path or path.rstrip("/").endswith("/login"):
+        return False
+    if "/app/next/" in path:
+        return True
+    if "/search" in path:
+        return True
+    if "/c/_/u/" in path and "/need/" in path:
+        return True
+    return False
+
+
+def _is_verification_wall(url, title, text):
+    """Blocking verification only — not the profile 'Finish account setup' checklist."""
+    path = _url_path(url)
+    if "/auth/not-verified/" in path:
+        return True
+    if "/auth/login" in path or path.rstrip("/").endswith("/login"):
+        return False
+    blob = f"{title or ''} {text or ''}"
+    if "finish account setup" in blob.lower():
+        return False
+    if _contains_whole_phrase(blob, "check your email"):
+        return True
+    if _any_whole_phrase(blob, ("one-time link", "one time link")):
+        return True
+    return False
+
+
+def _login_form_fields_present(driver):
+    if not driver:
+        return False
+    try:
+        has_email = bool(driver.find_elements(By.NAME, "email"))
+        has_password = bool(driver.find_elements(By.NAME, "password"))
+        return has_email and has_password
+    except Exception:
+        return False
+
+
+def _is_login_form_page(driver, url, text):
+    path = _url_path(url)
+    if _is_logged_in_url(url) or "/auth/not-verified/" in path:
+        return False
+    if "/auth/login" in path or path.rstrip("/").endswith("/login"):
+        return True
+    if _login_form_fields_present(driver):
+        return True
+    blob = f"{path} {text or ''}"
+    if _contains_whole_phrase(blob, "login") and _contains_whole_phrase(blob, "password"):
+        return True
+    return False
+
+
+def _has_left_login_page(driver):
+    """Any logged-in URL (including /app/next/...) counts. Do not wait for dashboard."""
+    url = ""
+    try:
+        url = driver.current_url or ""
+    except Exception:
+        return False
+    path = _url_path(url)
+    if "/auth/login" in path or path.rstrip("/").endswith("/login"):
+        return False
+    if "/app/next/" in path or "/search" in path or "/auth/not-verified/" in path:
+        return True
+    if _login_form_fields_present(driver):
+        return False
+    if "gocatalant.com" in (url or "").lower():
+        return True
+    return False
+
+
+def _log_login_failure_page(driver):
+    url, title, text = _login_page_url_title_text(driver)
+    snippet = " ".join((text or "").split())[:300]
+    print(f"  url={url}")
+    print(f"  title={title}")
+    print(f"  page_text={snippet}")
+    return url, title, snippet
+
+
+def classify_login_failure(driver, exc=None):
+    """Classify from current page URL, title, and visible text only.
+
+    Exception / stack text is ignored so a heap address containing '2fa' cannot
+    become MFA_REQUIRED. Matches whole words only.
+    """
+    del exc  # never scan exception text
+    url, title, text = _login_page_url_title_text(driver)
+    blob = f"{url} {title} {text}"
+
+    if _is_login_form_page(driver, url, text):
+        return "LOGIN_FORM"
+    if _is_verification_wall(url, title, text):
+        return "VERIFICATION_PAGE"
+    if _any_whole_phrase(blob, ("captcha", "recaptcha", "hcaptcha", "verify you are human")):
         return "CAPTCHA_REQUIRED"
-    if any(w in blob for w in ("two-factor", "2fa", "mfa", "verification code", "one-time")):
+    if _any_whole_phrase(blob, ("two-factor", "2fa", "mfa", "verification code")):
         return "MFA_REQUIRED"
-    if any(w in blob for w in ("locked", "disabled", "suspended")):
+    if _any_whole_phrase(blob, ("locked", "disabled", "suspended")):
         return "ACCOUNT_LOCKED"
-    if any(w in blob for w in ("access denied", "forbidden", "not authorized")):
+    if _any_whole_phrase(blob, ("access denied", "forbidden", "not authorized")):
         return "ACCESS_DENIED"
-    if any(w in blob for w in ("cors", "preflight")):
+    if _any_whole_phrase(blob, ("cors", "preflight")):
         return "CORS_PREFLIGHT_FAILED"
-    if any(w in blob for w in ("invalid", "incorrect", "wrong password", "authentication failed", "login failed")):
+    if _any_whole_phrase(
+        blob, ("invalid", "incorrect", "wrong password", "authentication failed", "login failed")
+    ):
         return "INVALID_CREDENTIALS_RESPONSE"
-    if isinstance(exc, TimeoutException) or "timeout" in str(exc or "").lower():
-        return "LOGIN_TIMEOUT"
+    if _is_logged_in_url(url):
+        return "LOGGED_IN_NO_CARDS"
     return "UNKNOWN"
 
 
 # ============================
 # SESSION MANAGEMENT
 # ============================
+def _session_cookie_expiry_label(cookies):
+    """Expiry of Catalant's session cookie. Name is `session` or, on this site, `ss`."""
+    by_name = {(c.get("name") or ""): c for c in (cookies or []) if c.get("name")}
+    cookie = None
+    used_name = None
+    for name in ("session", "ss"):
+        if name in by_name:
+            cookie = by_name[name]
+            used_name = name
+            break
+    if cookie is None:
+        lower = {k.lower(): (k, v) for k, v in by_name.items()}
+        if "session" in lower:
+            used_name, cookie = lower["session"]
+        elif "ss" in lower:
+            used_name, cookie = lower["ss"]
+    if cookie is None:
+        return "not found"
+    exp = cookie.get("expiry", cookie.get("expires"))
+    if exp in (None, ""):
+        prefix = f"{used_name} " if used_name and used_name != "session" else ""
+        return f"{prefix}no expiry attribute"
+    try:
+        ts = float(exp)
+        dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+        formatted = dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+    except (TypeError, ValueError, OSError, OverflowError):
+        formatted = str(exp)
+    if used_name and used_name != "session":
+        return f"{used_name} {formatted}"
+    return formatted
+
+
 def save_cookies(driver):
     """Save session cookies to Supabase AND local file as fallback."""
     cookies = driver.get_cookies()
     cookie_count = len(cookies) if cookies is not None else 0
+    print(f"Saved {cookie_count} cookies")
+    print(f"session cookie expiry: {_session_cookie_expiry_label(cookies)}")
     try:
         db.save_scraper_session(PLATFORM, cookies or [])
         print(f"  Saved {cookie_count} cookie(s) to Supabase scraper_sessions")
@@ -694,6 +846,17 @@ def save_cookies(driver):
             diagnostics={**_safe_driver_info(driver), "operation": "cookie_save_file", "record_count": cookie_count},
         )
     return True
+
+
+def _cookie_for_restore(cookie):
+    """Drop null fields so Selenium will add session cookies (e.g. `ss` with no expiry)."""
+    payload = {}
+    for key, value in (cookie or {}).items():
+        if value is None:
+            continue
+        payload[key] = value
+    return payload
+
 
 def load_cookies(driver):
     """Load cookies from Supabase first, fall back to local file."""
@@ -756,9 +919,9 @@ def load_cookies(driver):
         time.sleep(2)
         driver.delete_all_cookies()
         for cookie in cookies:
-            if 'domain' in cookie and '.gocatalant.com' in cookie['domain']:
+            if "domain" in cookie and ".gocatalant.com" in cookie["domain"]:
                 try:
-                    driver.add_cookie(cookie)
+                    driver.add_cookie(_cookie_for_restore(cookie))
                 except Exception:
                     pass
         return True
@@ -796,17 +959,19 @@ def perform_login(driver):
         submit.click()
         submitted = True
 
-        WebDriverWait(driver, 30).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, ".need-card-inline-name"))
-        )
-
+        WebDriverWait(driver, 30).until(_has_left_login_page)
         save_cookies(driver)
-        _navigate_to_search(driver)
+        driver.get(SEARCH_URL)
+        WebDriverWait(driver, 40).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, PROJECT_CARD_NAME_SELECTOR))
+        )
+        save_cookies(driver)
         print("Login successful -> Search Projects")
         return {"success": True, "classification": None, "alert_sent": False, "message": "ok"}
     except Exception as e:
         print(f"❌ Login failed: {redact_sensitive_text(e)}")
-        classification = classify_login_failure(driver, e)
+        _fail_url, _fail_title, page_snippet = _log_login_failure_page(driver)
+        classification = classify_login_failure(driver)
         context = f"LOGIN_FAILURE:{classification}"
         info = _safe_driver_info(driver)
         diagnostics = {
@@ -835,6 +1000,7 @@ def perform_login(driver):
             f"Login classification: {classification}\n"
             f"Current URL: {info.get('current_url')}\n"
             f"Page title: {info.get('page_title')}\n"
+            f"Page text: {page_snippet}\n"
             f"Email field found: {email_found}\n"
             f"Password field found: {password_found}\n"
             f"Submit button found: {submit_found}\n"
@@ -2028,6 +2194,7 @@ def initialize_driver():
 
 DASHBOARD_URL = "https://app.gocatalant.com/c/_/u/0/dashboard/"
 SEARCH_URL = "https://app.gocatalant.com/c/_/u/0/search/?form_name=SearchForm&enable_pagination=True&enable_facets=True&card_action_show_need=True&use_recommended=y&display_result_count=True"
+PROJECT_CARD_NAME_SELECTOR = ".need-card-inline-name"
 
 
 def safe_quit_driver(driver):
@@ -2322,7 +2489,7 @@ def run_monitoring_cycle_with_browser_recovery(
 
 
 def _navigate_to_search(driver):
-    """Navigate to Search Projects page. Loads dashboard first so the AJAX session is active."""
+    """Cookie-path Search Projects: dashboard warm-up then SEARCH_URL (AJAX session)."""
     driver.get(DASHBOARD_URL)
     time.sleep(4)
     driver.get(SEARCH_URL)
@@ -2337,8 +2504,9 @@ def setup_session(driver):
         _navigate_to_search(driver)
         try:
             WebDriverWait(driver, 20).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, ".need-card-inline-name"))
+                EC.presence_of_element_located((By.CSS_SELECTOR, PROJECT_CARD_NAME_SELECTOR))
             )
+            save_cookies(driver)
             print("Logged in via cookies -> Search Projects")
             return {"success": True, "classification": None, "alert_sent": False, "message": "cookies"}
         except Exception:
